@@ -1,0 +1,4 @@
+(printf "*1\r\n\$4\r\nPING\r\n";) | nc localhost 6379
+(printf "*2\r\n\\$4\r\nECHO\r\n\$4\r\ntest\r\n";) | nc localhost 6379
+(printf "*3\r\n\$3\r\nSET\r\n\$3\r\nfoo\r\n\$3\r\n123\r\n";) | nc localhost 6379
+(printf "*2\r\n\$3\r\nGET\r\n\$3\r\nfoo\r\n";) | nc localhost 6379
