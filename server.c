@@ -229,7 +229,7 @@ int connectToSlave(int *slave_sock, const char *address, const int port) {
 
 int handshake(int master_sock, int port, Info info) {
 	char *send_buff;
-	char recv_buff[64];
+	char recv_buff[128];
 	char *ping = "*1\r\n$4\r\nPING\r\n";
 	// char confPort[50] = "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n";
 	char confPort[50] = "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n";
@@ -276,7 +276,14 @@ int handshake(int master_sock, int port, Info info) {
 
 	bzero(recv_buff, sizeof(recv_buff));
 
+	recv(master_sock, recv_buff, sizeof(recv_buff), 0);
+	printf("%s\n", recv_buff);
+
 	return 0;
+}
+
+void *listenToMaster(void* args) {
+
 }
 
 void *threadMain(void* args);
@@ -297,6 +304,9 @@ int main(int argc, char** argv) {
 		port = 6379;
 	}
 
+	Dict store;
+	store = DictCreate();
+
 	if (argc >= 5 && strcmp(argv[3], "--replicaof") == 0) {
 		info = initSlave();
 		char *address = strtok(argv[4], " ");
@@ -311,12 +321,26 @@ int main(int argc, char** argv) {
 		connectToMaster(&master_sock, masterAddr, masterPort);
 		handshake(master_sock, port, info);
 
+		pthread_t threadId;
+		threadArgs *args; 
+
+		client_sock = acceptCon(server_sock);
+
+		printf("Client connected\n");
+
+		if ((args = malloc(sizeof(threadArgs))) == NULL) printf("malloc() fail\n");
+		
+		args->clnt_sock = master_sock;
+		args->store = store;
+		args->info = info;
+
+		if (pthread_create(&threadId, NULL, threadMain, args) != 0) printf("phtread_create() fail\n");
+
 	} else {
 		info = initMaster();
 	}
 
-	Dict store;
-	store = DictCreate();
+	
 
 	// !!!
 	server_sock = createServer(port);
