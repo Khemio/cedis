@@ -199,34 +199,6 @@ int connectToMaster(int *master_sock, const char *address, const int port) {
 	return 0;
 }
 
-int connectToSlave(int *slave_sock, const char *address, const int port) {
-	int reuse = REUSE;
-
-	*slave_sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (*slave_sock == -1) {
-		printf("Socket creation failed: %s...\n", strerror(errno));
-		return 1;
-	}
-	//
-	// Since the tester restarts your program quite often, setting SO_REUSEADDR
-	// ensures that we don't run into 'Address already in use' errors
-	if (setsockopt(*slave_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-		printf("SO_REUSEADDR failed: %s \n", strerror(errno));
-		return 1;
-	}
-	
-	struct sockaddr_in slave_addr = { .sin_family = AF_INET ,
-									 .sin_port = htons(port),
-									 .sin_addr = { htonl(inet_network(address)) },
-									};
-
-	if (connect(*slave_sock, (struct sockaddr *)&slave_addr, sizeof(slave_addr)) < 0) {
-		printf("connect() failed: %s \n", strerror(errno));
-		return 1;
-	}
-	return 0;
-}
-
 int handshake(int master_sock, int port, Info info) {
 	char *send_buff;
 	char recv_buff[128];
@@ -276,14 +248,11 @@ int handshake(int master_sock, int port, Info info) {
 
 	bzero(recv_buff, sizeof(recv_buff));
 
+	// TODO: Handle RDB file transfer
 	recv(master_sock, recv_buff, sizeof(recv_buff), 0);
 	printf("%s\n", recv_buff);
 
 	return 0;
-}
-
-void *listenToMaster(void* args) {
-
 }
 
 void *threadMain(void* args);
@@ -317,10 +286,10 @@ int main(int argc, char** argv) {
 			masterAddr = strdup(address);
 		}
 		masterPort = atoi(strtok(NULL, "\0"));
-		// !!!
 		connectToMaster(&master_sock, masterAddr, masterPort);
 		handshake(master_sock, port, info);
 
+		// TODO: Extract and encapsulate (1)
 		pthread_t threadId;
 		threadArgs *args; 
 
@@ -340,12 +309,10 @@ int main(int argc, char** argv) {
 		info = initMaster();
 	}
 
-	
-
-	// !!!
 	server_sock = createServer(port);
 
 	for (;;) {
+		// TODO: Extract and encapsulate (2)
 		pthread_t threadId;
 		threadArgs *args; 
 
@@ -434,16 +401,9 @@ void *threadMain(void* args) {
 
 	for (;;) {
 		recvSize = recv(client_sock, buff, sizeof(buff), 0);
-		// printf("%d\n%s\n", recvSize, info->entries[0].value.str);
-		if (strcmp(info->entries[0].value.str, "slave") == 0) {
-			printf("%s\n", buff);
-		}
-	
-		// if (buff[0] != '*') printf("size: %d, start: %c\n", recvSize, buff[0]);
-
 
 		if (recvSize > 0) {
-			// RDB Transfer fucks up parser
+			// TODO: Make RDB parser
 			parseReq(req, buff, recvSize);
 			handleReq(client_sock, req, store, info);
 	
@@ -458,7 +418,6 @@ void *threadMain(void* args) {
 }
 
 void handleReq(int client_sock, const struct request *req, Dict store, Info info) {
-	printf("%s\n", req->params[0].val);
 	if (strncmp(req->params[0].val, "ping", req->params[0].len) == 0) {
 			char *res = "+PONG\r\n";
 			send(client_sock, res, strlen(res), 0);
@@ -489,8 +448,6 @@ void handleReq(int client_sock, const struct request *req, Dict store, Info info
 		now = time_mili();
 		// TODO: add mutex?
 		DictInsert(store, key, val, expiry, now + expiry);
-
-		// if (strcmp(info->entries[0].value.str, "slave")) {}
 
 		if (strcmp(info->entries[0].value.str, "master") == 0) {
 			char *res = "+OK\r\n";
@@ -587,14 +544,8 @@ void handleReq(int client_sock, const struct request *req, Dict store, Info info
 		char *res = "+OK\r\n";
 
 		if (strncmp(req->params[1].val, "listening-port", req->params[1].len) == 0) {
-			// Save port
 			int port = atoi(req->params[2].val);
-			// int slave_sock;
-			// connectToSlave(&slave_sock, "127.0.0.1", port);
-
-			// append(info->entries[3].value.lt, slave_sock);
 			append(info->entries[3].value.lt, client_sock);
-			// printf("%d\n", client_sock);
 
 			send(client_sock, res, strlen(res), 0);
 		} else if (strncmp(req->params[1].val, "capa", req->params[1].len) == 0) {
@@ -605,8 +556,6 @@ void handleReq(int client_sock, const struct request *req, Dict store, Info info
 		size_t buff_size = 0;
 		char *id;
 		char offset;
-
-		// printf("%d\n", client_sock);
 
 		if (strncmp(req->params[1].val, "?", req->params[1].len) == 0 && atoi(req->params[2].val) == -1) {
 			for (int i = 0; i < info->size; i++) {
@@ -637,10 +586,7 @@ void handleReq(int client_sock, const struct request *req, Dict store, Info info
 			buff_size += binary_file_len;
 			// send_buff[buff_size] = '\n';
 			
-			printf("%d\n", client_sock);
 			int sendSize = send(client_sock, send_buff, buff_size, 0);	
-			printf("Sent: %d\n", sendSize);
-			
 		}	
 	}
 }
