@@ -10,10 +10,12 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <ctype.h>
 
 #include "utils/parser.h"
 #include "utils/timing.h"
 #include "utils/dict.h"
+#include "utils/resp_reader.h"
 
 #define BACKLOG 10
 #define REUSE 1
@@ -394,6 +396,101 @@ int acceptCon(int server_sock) {
 
 	return client_sock;
 }
+
+
+static int sendAll(int fd, const void *data, size_t len) {
+    const unsigned char *bytes = data;
+
+    while (len > 0) {
+        ssize_t sent = send(fd, bytes, len, MSG_NOSIGNAL);
+
+        if (sent > 0) {
+            bytes += sent;
+            len -= (size_t)sent;
+            continue;
+        }
+
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+
+        return -1;
+    }
+
+    return 0;
+}
+
+static int commandEquals(
+    const struct resp_arg *arg,
+    const char *name
+) {
+    size_t name_len = strlen(name);
+
+    if (arg->len != name_len) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < name_len; i++) {
+        if (tolower((unsigned char)arg->data[i]) !=
+            (unsigned char)name[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static int handleRespRequest(
+    int client_sock,
+    const struct resp_request *req
+) {
+    const struct resp_arg *command = &req->args[0];
+
+    if (commandEquals(command, "ping")) {
+        if (req->argc != 1) {
+            const char *err =
+                "-ERR wrong number of arguments for PING\r\n";
+            return sendAll(client_sock, err, strlen(err));
+        }
+
+        return sendAll(client_sock, "+PONG\r\n", 7);
+    }
+
+    if (commandEquals(command, "echo")) {
+        if (req->argc != 2) {
+            const char *err =
+                "-ERR wrong number of arguments for ECHO\r\n";
+            return sendAll(client_sock, err, strlen(err));
+        }
+
+        const struct resp_arg *message = &req->args[1];
+
+        char header[64];
+        int n = snprintf(
+            header, sizeof(header),
+            "$%zu\r\n", message->len
+        );
+
+        if (n < 0 || (size_t)n >= sizeof(header)) {
+            return -1;
+        }
+
+        if (sendAll(client_sock, header, (size_t)n) < 0 ||
+            sendAll(client_sock, message->data, message->len) < 0 ||
+            sendAll(client_sock, "\r\n", 2) < 0) {
+            return -1;
+        }
+
+        return 0;
+    }
+
+    const char *err =
+        "-ERR command not yet implemented\r\n";
+
+    return sendAll(client_sock, err, strlen(err));
+}
+
 
 void *threadMain(void* args) {
 	int client_sock = ((threadArgs *)args) -> clnt_sock;
