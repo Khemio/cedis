@@ -119,10 +119,14 @@ int append(list l, int sock_fd) {
 }
 
 Info initMaster(void) {
-	// TODO: Extract and add mem cleanup
-	Info info;
-	info = malloc(sizeof(Info));
-	info->size = 4;
+	Info info = malloc(sizeof *info);
+
+    if (info == NULL) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+
+    info->size = 4;
 
 	info->entries = malloc(info->size * sizeof(entrie));
 
@@ -148,11 +152,14 @@ Info initMaster(void) {
 }
 
 Info initSlave(void) {
-	// TODO: Extract and add mem cleanup
-	Info info;
-	info = malloc(sizeof(Info));
-	info->size = 1;
-	// info->size = 3;
+	Info info = malloc(sizeof *info);
+
+    if (info == NULL) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+
+    info->size = 4;
 
 	info->entries = malloc(info->size * sizeof(entrie));
 
@@ -394,7 +401,7 @@ void *threadMain(void* args) {
 	Info info = ((threadArgs *)args) -> info;
 
 	char buff[256];
-	int recvSize = 1;
+	ssize_t recvSize = 1;
 
 	struct request *req;
     req = malloc(sizeof(struct request));
@@ -402,19 +409,34 @@ void *threadMain(void* args) {
 	for (;;) {
 		recvSize = recv(client_sock, buff, sizeof(buff), 0);
 
-		if (recvSize > 0) {
-			// TODO: Make RDB parser
-			parseReq(req, buff, recvSize);
-			handleReq(client_sock, req, store, info);
-	
-
-			memset(buff, 0, sizeof(buff));
+		if (recvSize == 0) {
+			// Client disconnected.
+			break;
 		}
+
+		if (recvSize < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			perror("recv");
+			break;
+		}
+
+		// TODO: Make RDB parser
+		parseReq(req, buff, recvSize);
+		handleReq(client_sock, req, store, info);
+		freeReq(req);
+
+		memset(buff, 0, sizeof(buff));
 	}
 
 	close(client_sock);
 
-	return 0;
+	free(args);
+	free(req);
+
+	return NULL;
 }
 
 void handleReq(int client_sock, const struct request *req, Dict store, Info info) {

@@ -17,4 +17,6 @@ struct request {
 
 void parseReq(struct request* req, const char* recv, size_t len);
 
+void freeReq(struct request *req);
+
 #endif

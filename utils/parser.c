@@ -18,10 +18,15 @@ void parseReq(struct request* req, const char* recv, size_t len) {
 	// printf("%s\n", recv);
 
 
-	buff = calloc(len, sizeof(char));
-	token = calloc(len, sizeof(char));
+	buff = malloc(len + 1);
 
-	strncpy(buff, recv, len);
+	if (buff == NULL) {
+		perror("malloc");
+		exit(EXIT_FAILURE);
+	}
+
+	memcpy(buff, recv, len);
+	buff[len] = '\0';
 
 	token = strtok(buff, "\r");
 
@@ -41,9 +46,26 @@ void parseReq(struct request* req, const char* recv, size_t len) {
 	memset(token, 0, strlen(token));
 
 	while ((token = strtok(NULL, "\r")) != NULL) {
-        token++;
+		// Each token should begin with LF after splitting on CR.
+		if (token[0] != '\n') {
+			fprintf(stderr, "Invalid RESP line ending\n");
+			break;
+		}
 
-        if (token[0] == '$') {
+		token++;
+
+		// Ignore the final newline left by strtok().
+		if (token[0] == '\0') {
+			break;
+		}
+
+		// Never access beyond the allocated parameter array.
+		if (idx >= req->nParam) {
+			fprintf(stderr, "Too many RESP parameters\n");
+			break;
+		}
+
+		if (token[0] == '$') {
             // req->params[idx].len = (int)(token[1] - '0');
 			token++;
             req->params[idx].len = atoi(token);
@@ -51,21 +73,37 @@ void parseReq(struct request* req, const char* recv, size_t len) {
         } else {
             req->params[idx].val = calloc(1, strlen(token) + 1);
             strncpy(req->params[idx].val, token, strlen(token));
-            memset(token, 0, strlen(token));
+            // memset(token, 0, strlen(token));
 		    idx++;
         }
 
 	}
 
     free(buff);
-    free(token);
 
-	for (int i = 0; i < req->nParam; i++) {
-		for(int j = 0; req->params[i].val[j]; j++){
-			req->params[i].val[j] = tolower(req->params[i].val[j]);
+	if (req->nParam > 0 && req->params[0].val != NULL) {
+		char *command = req->params[0].val;
+
+		for (size_t i = 0; command[i] != '\0'; i++) {
+			command[i] = (char)tolower((unsigned char)command[i]);
 		}
 	}
 
+}
+
+void freeReq(struct request *req) {
+    if (req == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < req->nParam; i++) {
+        free(req->params[i].val);
+    }
+
+    free(req->params);
+
+    req->params = NULL;
+    req->nParam = 0;
 }
 
 // int main(void) {
