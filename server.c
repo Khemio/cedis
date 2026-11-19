@@ -397,7 +397,6 @@ int acceptCon(int server_sock) {
 	return client_sock;
 }
 
-
 static int sendAll(int fd, const void *data, size_t len) {
     const unsigned char *bytes = data;
 
@@ -439,7 +438,6 @@ static int commandEquals(
 
     return 1;
 }
-
 
 static int handleRespRequest(
     int client_sock,
@@ -492,48 +490,47 @@ static int handleRespRequest(
 }
 
 
-void *threadMain(void* args) {
-	int client_sock = ((threadArgs *)args) -> clnt_sock;
-	Dict store = ((threadArgs *)args) -> store;
-	Info info = ((threadArgs *)args) -> info;
+void *threadMain(void *raw_args) {
+    threadArgs *args = raw_args;
 
-	char buff[256];
-	ssize_t recvSize = 1;
+    int client_sock = args->clnt_sock;
+    free(args);
 
-	struct request *req;
-    req = malloc(sizeof(struct request));
+    struct resp_reader reader = {
+        .fd = client_sock
+    };
 
-	for (;;) {
-		recvSize = recv(client_sock, buff, sizeof(buff), 0);
+    for (;;) {
+        struct resp_request req = {0};
 
-		if (recvSize == 0) {
-			// Client disconnected.
-			break;
-		}
+        enum resp_read_status status =
+            resp_reader_next(&reader, &req);
 
-		if (recvSize < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
+        if (status == RESP_READ_CLOSED) {
+            break;
+        }
 
-			perror("recv");
-			break;
-		}
+        if (status != RESP_READ_OK) {
+            fprintf(stderr,
+                "Client read failed: status %d\n",
+                (int)status);
+            break;
+        }
 
-		// TODO: Make RDB parser
-		parseReq(req, buff, recvSize);
-		handleReq(client_sock, req, store, info);
-		freeReq(req);
+        int result = handleRespRequest(client_sock, &req);
 
-		memset(buff, 0, sizeof(buff));
-	}
+        resp_request_free(&req);
 
-	close(client_sock);
+        if (result < 0) {
+            perror("send");
+            break;
+        }
+    }
 
-	free(args);
-	free(req);
+    resp_reader_free(&reader);
+    close(client_sock);
 
-	return NULL;
+    return NULL;
 }
 
 void handleReq(int client_sock, const struct request *req, Dict store, Info info) {
