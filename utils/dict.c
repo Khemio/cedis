@@ -127,36 +127,62 @@ grow(Dict d)
 }
 
 /* insert a new key-value pair into an existing dictionary */
-void
-DictInsert(Dict d, const char *key, const char *value, int expiry, long expire_at)
-{
-    struct elt *e;
-    unsigned long h;
 
+void DictInsert(
+    Dict d,
+    const char *key,
+    const char *value,
+    int expiry,
+    long expire_at
+) {
+    assert(d);
     assert(key);
     assert(value);
 
-    e = malloc(sizeof(*e));
+    unsigned long h = hash_function(key) % d->size;
 
-    assert(e);
+    // First check whether the key already exists.
+    for (struct elt *e = d->table[h];
+         e != NULL;
+         e = e->next) {
+
+        if (strcmp(e->key, key) == 0) {
+            char *new_value = strdup(value);
+            assert(new_value != NULL);
+
+            free(e->value);
+
+            e->value = new_value;
+            e->expiry = expiry;
+            e->expire_at = expire_at;
+
+            return;
+        }
+    }
+
+    // New key: allocate a new entry.
+    struct elt *e = malloc(sizeof *e);
+    assert(e != NULL);
 
     e->key = strdup(key);
     e->value = strdup(value);
-    e->expire_at = expire_at;
-    e->expiry = expiry;
 
-    h = hash_function(key) % d->size;
+    assert(e->key != NULL);
+    assert(e->value != NULL);
+
+    e->expiry = expiry;
+    e->expire_at = expire_at;
 
     e->next = d->table[h];
     d->table[h] = e;
 
     d->n++;
 
-    /* grow table if there is not enough room */
-    if(d->n >= d->size * MAX_LOAD_FACTOR) {
+    if (d->n >= d->size * MAX_LOAD_FACTOR) {
         grow(d);
     }
 }
+
 
 /* return the most recently inserted value associated with a key */
 /* or 0 if no matching key is present */
@@ -199,6 +225,8 @@ DictDelete(Dict d, const char *key)
             free(e->key);
             free(e->value);
             free(e);
+
+            d->n--;
 
             return;
         }
