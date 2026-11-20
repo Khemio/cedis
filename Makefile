@@ -6,11 +6,10 @@ TEST_CFLAGS := -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Werr
 
 SAN ?=
 
-LEGACY_SRC := utils/dict.c utils/parser.c utils/timing.c
 RESP_SRC := utils/resp.c utils/resp_stream.c utils/resp_reader.c
 KV_SRC := utils/kv.c
 
-SERVER_SRC := server.c $(LEGACY_SRC) $(RESP_SRC) $(KV_SRC)
+SERVER_SRC := server.c $(RESP_SRC) $(KV_SRC)
 
 .PHONY: all server test clean
 
