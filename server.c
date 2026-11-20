@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -13,6 +14,7 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #include "utils/kv.h"
 #include "utils/resp_reader.h"
@@ -208,13 +210,69 @@ int main(int argc, char** argv) {
 	sigaddset(&stop_signals, SIGINT);
 	sigaddset(&stop_signals, SIGTERM);
 
+
+	// New
+	sigset_t previous_mask;
+
+	int mask_rc = pthread_sigmask(
+		SIG_BLOCK,
+		&stop_signals,
+		&previous_mask
+	);
+
+	if (mask_rc != 0) {
+		fprintf(stderr, "pthread_sigmask: %s\n",
+				strerror(mask_rc));
+		close(server_sock);
+		pthread_attr_destroy(&worker_attr);
+		kv_destroy(kv);
+		return EXIT_FAILURE;
+	}
+
+	sigset_t wait_mask = previous_mask;
+
+	sigdelset(&wait_mask, SIGINT);
+	sigdelset(&wait_mask, SIGTERM);
+	
 	
 	while (!stop_requested) {
+		fd_set readable;
+
+		FD_ZERO(&readable);
+		FD_SET(server_sock, &readable);
+
+		int ready = pselect(
+			server_sock + 1,
+			&readable,
+			NULL,
+			NULL,
+			NULL,
+			&wait_mask
+		);
+
+		if (ready < 0) {
+			if (errno == EINTR)
+				continue;
+
+			perror("pselect");
+			break;
+		}
+
+		if (stop_requested)
+			break;
+
+		if (!FD_ISSET(server_sock, &readable))
+			continue;
+
 		int client_sock = acceptCon(server_sock);
 
 		if (client_sock < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR ||
+				errno == EAGAIN ||
+				errno == EWOULDBLOCK ||
+				errno == ECONNABORTED) {
 				continue;
+			}
 
 			perror("accept");
 			break;
@@ -224,6 +282,10 @@ int main(int argc, char** argv) {
 			close(client_sock);
 			break;
 		}
+
+		// Keep your existing thread allocation,
+		// registerClient(), and pthread_create()
+		// code here, without the old signal-mask calls.
 
 		threadArgs *args = malloc(sizeof *args);
 
@@ -242,19 +304,6 @@ int main(int argc, char** argv) {
 
 		
 		pthread_t thread_id;
-		sigset_t previous_mask;
-
-		// Workers inherit blocked shutdown signals.
-		int mask_rc = pthread_sigmask(
-			SIG_BLOCK, &stop_signals, &previous_mask
-		);
-
-		if (mask_rc != 0) {
-			fprintf(stderr, "pthread_sigmask: %s\n",
-					strerror(mask_rc));
-			releaseClient(args);
-			break;
-		}
 
 		int rc = pthread_create(
 			&thread_id,
@@ -262,14 +311,6 @@ int main(int argc, char** argv) {
 			threadMain,
 			args
 		);
-
-		// Restore the main thread's signal mask.
-		mask_rc = pthread_sigmask(
-			SIG_SETMASK, &previous_mask, NULL
-		);
-
-		if (mask_rc != 0)
-			abort();
 
 		if (rc != 0) {
 			fprintf(stderr, "pthread_create: %s\n",
@@ -332,8 +373,14 @@ int createServer(int port) {
         goto fail;
     }
 
-    if (listen(server_sock, BACKLOG) < 0)
-        goto fail;
+    if (listen(server_sock, BACKLOG) < 0) goto fail;
+
+	int flags = fcntl(server_sock, F_GETFL);
+
+	if (flags < 0 ||
+		fcntl(server_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+		goto fail;
+	}
 
     printf("Waiting for a client to connect...\n");
 
