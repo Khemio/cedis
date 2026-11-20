@@ -1,61 +1,66 @@
-# Known limitations and improvement priorities
+# Cedis: known limitations and remaining improvements
 
-> Review of [`Khemio/cedis`](https://github.com/Khemio/cedis) `main` as inspected on 2026-11-13. This is a documentation-oriented source review, **not** a completed sanitizer run, test audit, or security assessment.
+> **Scope:** stable server on `cleanup/cv-ready`, reviewed 2026-11-20. This replaces the 2026-11-13 review of the original implementation. Issues in the preserved `codecrafters/replication-baseline` branch are **not** automatically issues in the stable build.
 
-Cedis is an educational Redis-inspired server. It should only be used in a controlled, local learning environment until the issues below are addressed. They are listed to make the current state transparent and to guide development.
+Cedis is a small, educational Redis-inspired key-value server, not a drop-in Redis replacement or a hardened service. The supported command set is `PING`, `ECHO`, `SET` (including `PX`), and `GET`. Use it in a controlled local development environment.
 
-## Priority 0 — memory safety and basic execution
+## 1. Highest-priority remaining correctness and reliability work
 
-| Area | Observation in the source | Recommended change |
+| Area | Current observation | Suggested improvement |
 | --- | --- | --- |
-| Replication metadata allocation | `initMaster`/`initSlave` allocate `sizeof(Info)` (a pointer typedef) rather than the size of the pointed-to `struct Info`. | Allocate `sizeof(*info)`, check results, and add a corresponding destructor. |
-| RDB payload conversion | `hexToBinary` offsets the pointer returned by `malloc` by one, then indexes through the requested length. | Keep the original allocation pointer, allocate sufficient bytes, and remove out-of-bounds writes. |
-| Request parser ownership | Token buffers and per-request argument arrays are not consistently released; tokenization and freeing logic are unsafe. | Use a length-aware parser with explicit ownership and a request cleanup routine. |
-| Reply formatting | Several commands use fixed-size `sprintf` buffers; `INFO` allocates/reallocates insufficient space for formatted content. | Calculate required lengths, use bounded formatting, and validate response sizes. |
-| Connection lifecycle | The client worker never exits its receive loop on `recv() == 0` or `recv() < 0`. | Handle EOF/errors, release thread arguments and requests, close sockets, and decide whether to detach/join threads. |
-| Replica initialization | The `--replicaof` branch calls `acceptCon(server_sock)` before `server_sock` is initialized. | Fix startup ordering and separately establish the upstream replication connection. |
+| **Startup failure cleanup** | In `server.c`, failure of `pthread_attr_init()`, `pthread_attr_setdetachstate()`, or `sigaction()` can return without releasing the previously created listening socket and/or KV store. These paths are uncommon but real ownership gaps. | Consolidate initialization cleanup and test representative failures where practical. |
+| **`pselect()` descriptor limit** | The listener is inserted into an `fd_set` using `FD_SET(server_sock, ...)` without verifying `server_sock < FD_SETSIZE`. A high-numbered descriptor can exceed the range supported by `select`-style sets. | Guard the descriptor range and fail cleanly, or use `poll`/`ppoll` instead. |
+| **Unbounded client resource usage** | Every accepted connection gets a detached thread and an input buffer; there is no maximum client count, read deadline, idle timeout, or per-client work quota. | Add client admission limits and connection timeouts before considering broader deployment. |
+| **Argument handling** | `--port` is validated when it appears first; unrelated or extra arguments are not consistently rejected. `--replicaof` is explicitly rejected. | Parse all arguments with a single strict option parser, reject unexpected tokens, and add CLI tests. |
 
-## Priority 1 — correctness and protocol behavior
+These are actionable issues in the current stable source. They are not evidence that the already-tested normal startup, request handling, or shutdown paths are broken.
 
-| Area | Observation in the source | Recommended change |
-| --- | --- | --- |
-| Duplicate keys | `DictInsert` always prepends a new entry, so `SET` does not replace an existing value. | Update an existing key or remove its previous entry before inserting. |
-| Dictionary size | `DictDelete` removes an entry but does not decrement `d->n`. | Maintain accurate entry counts and add invariant tests. |
-| Expiration | Epoch milliseconds returned as `long` are narrowed to `int`; the helper uses `CLOCK_REALTIME`. | Use consistent 64-bit timestamp types and define time source/expiration rules. |
-| Request framing | One `recv()` is treated as one request; RESP arrays with 10+ elements are miscounted. | Buffer bytes across reads and parse length-prefixed RESP frames incrementally. |
-| Payload integrity | The parser lowercases **all** arguments, including keys and values. | Case-fold only command names; preserve payload bytes exactly. |
-| Shared state | Multiple pthreads read/write the same dictionary with no synchronization. | Introduce synchronization or switch to a single-threaded event loop; test with concurrent clients. |
-| Network writes | The code generally assumes one `send()` transmits the full response. | Handle partial writes, interruptions, and socket errors. |
+## 2. Intentional feature and compatibility boundaries
 
-## Priority 2 — feature completeness and maintainability
+| Area | Current behavior / limitation |
+| --- | --- |
+| **Commands** | Only `PING`, `ECHO`, `SET`, and `GET` are implemented; `PX` is the supported `SET` option. No `DEL` command is exposed even though the KV module provides an internal removal operation. |
+| **Request protocol** | The parser accepts only flat RESP2 arrays containing bulk-string arguments; it is not a complete RESP2/RESP3 parser. |
+| **Input limits** | At most 1,024 arguments, 1 MiB per bulk string, and 2 MiB of buffered input per connection. A request exceeding these limits is not supported. |
+| **Storage** | Memory-only storage; process exit loses all data. No AOF, RDB persistence, replication, or failover. |
+| **Expiration** | `PX` uses monotonic millisecond deadlines and expires entries lazily on lookup. Expired but untouched entries continue to occupy memory until accessed or the store is destroyed. |
+| **Concurrency** | A single mutex protects the hash table, serializing all KV operations. The implementation has no benchmarked throughput or scalability guarantees. |
+| **Security** | The listener binds to `INADDR_ANY`, with no authentication, TLS, access control, or client quotas. It must not be exposed to untrusted networks. |
+| **Platform** | POSIX threads/sockets and Linux-specific `MSG_NOSIGNAL` are used; Linux/WSL2 is the validated environment, not cross-platform portability. |
+| **Replication** | The stable build explicitly rejects `--replicaof`. Earlier unfinished experiments are preserved separately in `codecrafters/replication-baseline`. |
 
-| Area | Observation in the source | Recommended change |
-| --- | --- | --- |
-| Replication | Handshake, snapshot, replica-list tracking, and `SET` forwarding are partial; offsets and continuous synchronization are absent. | Treat replication as experimental until protocol and consistency tests pass. |
-| Persistence | The server only holds data in memory. An empty RDB-like payload is used for the experimental handshake, but persistence is not implemented. | Add real serialization and recovery only if persistence becomes a project goal. |
-| Tests | The repository has a file of manual `nc` examples but no committed automated test suite. | Add dictionary unit tests, parser fixtures, socket integration tests, and sanitizers. |
-| Portability | Build and networking code depend on POSIX APIs and the Makefile emits `server.exe`. | Document Linux/WSL support; optionally normalize output names and make flags. |
-| Reliability | Error handling is often incomplete or diagnostic-only. | Check all allocations, `pthread_create`, `bind`, `listen`, `accept`, `recv`, and `send` paths. |
+## 3. Testing and assurance gaps
 
-## Suggested verification checklist
+The current tests cover parser behavior; fragmented and pipelined reads; binary keys and values; overwrite/expiration; concurrent KV and TCP clients; malformed/truncated input; 1,000 short-lived connections; occupied-port handling; and SIGINT/SIGTERM shutdown with an idle client. The source builds without warnings under `-Werror`, and exercised tests have passed with AddressSanitizer and UndefinedBehaviorSanitizer.
 
-Before calling the server more than a local prototype, verify these behaviors with repeatable tests:
+Important qualifications:
 
-- `SET` overwrites the exact same key and never reveals older values later.
-- Key/value bytes are preserved, including mixed case, spaces, empty strings, and binary payloads if supported.
-- Requests split across multiple TCP packets and multiple requests received together are parsed correctly.
-- Connection shutdown, malformed frames, and out-of-range lengths do not crash or spin the server.
-- Expiration behaves consistently across clock changes and long-running processes.
-- Multiple clients can read/write without data races or hash-table corruption.
-- Memory checking (for example, AddressSanitizer and UndefinedBehaviorSanitizer) passes representative tests.
-- Replication works through handshake, state transfer, subsequent writes, disconnects, and reconnects before it is advertised as a supported feature.
+- **Race freedom is not proven.** Passing concurrent tests and ASan/UBSan runs is not equivalent to a successful ThreadSanitizer run or a formal concurrency proof.
+- **The full TCP integration suite is not part of `make test`.** The smoke, server-integration, connection-load, and error suites still require a server started separately on port 6381.
+- **Memory-pressure and fault-injection paths are lightly tested.** Allocation failures, thread-creation failures, unusual descriptor exhaustion, and repeated signal delivery deserve dedicated coverage.
+- **No long-duration or hostile-client testing.** Slow senders, idle clients, and a large number of simultaneous clients could exhaust threads, descriptors, or memory. The bounded receive buffer limits a single connection's buffered request bytes but is not a complete resource-control mechanism.
+- **No performance claims.** There are no published latency/throughput benchmarks or production workload measurements.
 
-## Recommended implementation order
+## 4. Resolved issues from the original review
 
-**Phase 1: stabilize the core.** Fix unsafe allocations and lifetimes, client disconnect handling, incremental RESP parsing, and correct `SET` semantics.
+The original 2026-11-13 review described a different codebase. Its major concerns should **not** be repeated as defects of the current stable server:
 
-**Phase 2: validate the storage engine.** Repair TTL math, add dictionary/parser tests, ensure accurate accounting, and choose thread safety semantics.
+- The tokenizer was replaced with an incremental, length-aware, binary-safe RESP reader and parser.
+- `SET` now replaces existing keys; the KV module maintains entry counts and resizes by relinking nodes.
+- TTL math uses 64-bit monotonic timestamps with checks for invalid/overflowing deadlines.
+- Shared KV operations are mutex-protected, and `GET` returns a copy that can be sent outside the lock.
+- Workers exit on socket closure/error and release their buffers, client descriptors, and bookkeeping objects.
+- Partial writes are handled by a send loop rather than assuming one `send()` is sufficient.
+- Shutdown uses a registered-client list, `shutdown()` on client sockets, and a condition variable to wait for worker cleanup.
+- `pselect()` with controlled signal masks addresses the lost-wakeup window in the original blocking-`accept()` design.
+- The original replication and RDB-handling code was removed from the stable build and preserved in a separate branch; its unfinished bugs remain relevant **only when continuing that branch**.
 
-**Phase 3: build confidence.** Add sanitizers and end-to-end tests, then implement and verify replication deliberately rather than building on the current proof-of-concept path.
+## 5. Recommended order
 
-This list is intentionally specific about observed code paths. It is not a claim that these are the only defects or that fixes have already been applied.
+1. **Small reliability pass:** fix startup-error cleanup and the `FD_SETSIZE` edge case; tighten command-line validation.
+2. **Improve repeatability:** run every TCP integration suite against an automatically managed server, including sanitizer variants when feasible.
+3. **Commit and present the stable branch:** ensure README, architecture, limitations, and roadmap match the build; merge only after final verification.
+4. **Optional future engineering:** client quotas/timeouts, load testing, more commands, and a scalable I/O model if the project grows.
+5. **Separate replication track:** resume CodeCrafters work on a dedicated branch with its own tests and compatibility requirements.
+
+**Status:** The core is suitable to describe as a tested educational systems project, with the limitations above disclosed. It is not a claim of production readiness or full Redis compatibility.

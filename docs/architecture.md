@@ -1,247 +1,201 @@
 
-# Cedis
+# Cedis architecture and implementation notes
 
-Cedis is an educational, Redis-inspired in-memory key-value server
-written in C. It implements a subset of the Redis Serialization
-Protocol (RESP2) over TCP, with custom storage, expiration, and
-concurrent client handling.
+> **Scope:** The stable core on [`cleanup/cv-ready`](https://github.com/Khemio/cedis/tree/cleanup/cv-ready), reviewed on 2026-11-20. Replication experiments are preserved separately on `codecrafters/replication-baseline`. This describes the implementation, not a production-readiness or security guarantee.
 
-The project began as an implementation of the CodeCrafters Redis
-challenge and has since been refactored to emphasize correctness,
-memory ownership, networking, and concurrency.
+## 1. Overview
 
-Cedis is not a production-ready database or a drop-in Redis
-replacement.
+Cedis is a Redis-inspired, in-memory TCP key-value server implemented in C. It accepts RESP2-style requests, dispatches four commands, and stores binary-safe keys and values in a custom hash table. One POSIX worker thread serves each accepted client; all workers access a shared, mutex-protected `KV` instance.
 
-## Features
+```mermaid
+flowchart TD
+    Client["TCP client"] --> Listener["Listening socket"]
+    Listener --> Wait["pselect + nonblocking accept"]
+    Wait --> Worker["Detached client pthread"]
+    Worker --> Reader["RESP reader"]
+    Reader --> Stream["Per-client byte stream"]
+    Stream --> Parser["RESP2 request parser"]
+    Parser --> Handler["Command dispatcher"]
+    Handler <--> Store["Shared KV store / mutex"]
+    Handler --> Replies["RESP response writer"]
+    Replies --> Client
+```
 
-- Binary-safe keys and values
-- Incremental RESP2 request parsing
-- TCP fragmentation and request pipelining
-- Custom hash table using FNV-1a hashing and separate chaining
-- Key replacement and dynamic hash-table resizing
-- Millisecond TTL support with lazy expiration
-- Concurrent clients using POSIX threads
-- Mutex-protected shared key-value storage
-- Graceful shutdown through SIGINT and SIGTERM
-- Automated unit, integration, and lifecycle tests
+The main thread manages listening, worker creation, and shutdown. It does **not** execute client commands. `server.c` currently contains startup, networking, dispatch, and connection-management functions; protocol and storage primitives are separate modules in `utils/`.
 
-### Supported commands
+## 2. Server startup and client connections
 
-| Command | Behavior |
+1. `main()` defaults to port `6379`, or parses `--port` as an integer in the range `1`–`65535`. The stable build rejects `--replicaof`.
+2. `kv_create()` initializes the shared store.
+3. `createServer()` creates an IPv4 TCP socket, sets `SO_REUSEADDR`, binds to `INADDR_ANY`, calls `listen()`, and marks the listening descriptor `O_NONBLOCK`. Socket setup failures close the descriptor and return `-1` with an appropriate `errno`.
+4. `main()` registers handlers for `SIGINT`/`SIGTERM`, blocks those signals outside its wait, and enters a `pselect()` loop.
+5. When the listening descriptor is readable, `accept()` obtains a client socket. The server allocates a `threadArgs` object, registers it as active, and starts a **detached** pthread running `threadMain()`.
+
+The listening socket is nonblocking, but accepted connections use blocking reads. On Linux, accepted sockets do not inherit the listener's `O_NONBLOCK` status in this implementation. The thread-per-connection architecture is deliberately simple, but there is no configured maximum number of simultaneous workers.
+
+## 3. RESP request processing
+
+These files separate network reads, byte buffering, and protocol parsing:
+
+| Component | Responsibility |
 | --- | --- |
-| `PING` | Returns `PONG` |
-| `ECHO message` | Returns the message as a bulk string |
-| `SET key value` | Creates or replaces a key |
-| `SET key value PX milliseconds` | Sets a key with an expiration time |
-| `GET key` | Returns the value or a null bulk string |
+| `utils/resp_stream.c` | Growable per-connection byte buffer; append and consume received bytes |
+| `utils/resp.c` | Length-aware parsing of one complete request; allocation and cleanup of request arguments |
+| `utils/resp_reader.c` | Repeatedly attempts parsing, reads more bytes via `recv()` when incomplete, and returns connection/read statuses |
+| `server.c` | Dispatches parsed requests and sends RESP-formatted responses |
 
-Command names are case-insensitive. Keys and values retain their
-original bytes.
+### Incremental framing
 
-## Requirements
+`resp_reader_next()` first asks `resp_parse_request()` whether its buffered bytes contain a complete request:
 
-- Linux or a compatible POSIX environment (tested in WSL2)
-- GCC
-- GNU Make
-- Python 3 for integration tests
-- Optional: `redis-cli`
+- **Complete:** the parser returns an owned `resp_request`, together with the number of consumed bytes. The reader removes those bytes while retaining any later pipelined requests.
+- **Incomplete:** the reader calls `recv()` to append more data, then retries. This supports requests fragmented across TCP reads.
+- **Invalid or out of memory:** it returns an error status, and the worker closes that connection.
+- **EOF:** an empty buffer means a clean close (`RESP_READ_CLOSED`); remaining incomplete bytes mean a truncated request (`RESP_READ_TRUNCATED`).
 
-## Build
+The parser accepts **nonempty flat RESP arrays of bulk strings** (`*N` followed by `$length` arguments). It does not implement arbitrary nested arrays, inline commands, or full RESP2/RESP3 support. The current bounds are:
 
-From the repository root:
+- Up to **1,024 arguments** per request (`MAX_ARGS`).
+- Up to **1 MiB per bulk string** (`MAX_BULK_LEN`).
+- Up to **2 MiB of buffered receive data** per connection (`RESP_STREAM_MAX_BYTES`).
+
+All argument data is copied into byte arrays with explicit lengths; embedded NUL bytes do not terminate a key or value. Commands are compared case-insensitively without modifying other arguments. `resp_request_free()` releases request-owned argument buffers after command execution.
+
+### Replies
+
+`sendAll()` retries interrupted sends and handles partial writes using `send(..., MSG_NOSIGNAL)`; the latter avoids termination from `SIGPIPE` on a disconnected client. `sendBulk()` emits a RESP bulk-string header, the exact payload bytes, and the terminating CRLF. Other replies are short RESP simple strings, errors, or the null bulk string `$-1\r\n`.
+
+## 4. Commands
+
+`handleRespRequest()` currently supports:
+
+| Request | Result |
+| --- | --- |
+| `PING` | `+PONG` |
+| `ECHO message` | Bulk string containing the original message bytes |
+| `SET key value` | Insert or replace; `+OK` on success |
+| `SET key value PX milliseconds` | Insert or replace with a positive millisecond TTL |
+| `GET key` | Bulk string for a present value; null bulk string if missing or expired |
+
+Wrong argument counts, unsupported options, and invalid expiration values produce RESP errors. Unsupported commands return an explicit not-implemented error. `INFO`, `REPLCONF`, and `PSYNC` are **not** part of this stable build.
+
+## 5. Storage engine: `utils/kv.c`
+
+The store is opaque to callers through `KV` (`utils/kv.h`). Internally, it consists of a bucket array and singly linked lists of entries:
+
+```text
+KV
+  buckets[0] -> entry -> entry -> NULL
+  buckets[1] -> NULL
+  ...
+  bucket_count, count
+  pthread_mutex_t
+
+entry:
+  key bytes + key length
+  value bytes + value length
+  has_expiry + expire_at_ms
+  next pointer
+```
+
+- **Hashing:** 64-bit FNV-1a over all key bytes, then modulo the current number of buckets.
+- **Initial capacity:** 16 buckets.
+- **Collision resolution:** separate chaining.
+- **Growth:** the bucket array doubles when the entry count reaches approximately 75% of the bucket count before inserting another entry. Resize **relinks existing entries** rather than duplicating their contents.
+- **Replacement:** setting an existing key replaces the value and its expiry metadata without creating another entry. An ordinary `SET` clears any previous expiry.
+- **Deletion:** an internal removal helper unlinks and frees an entry and decrements the count. A `kv_remove()` API exists, although no client-facing `DEL` command is implemented.
+
+### Ownership and synchronization
+
+The store copies keys and values into owned allocations. Each public KV operation that accesses or mutates the table acquires the store's mutex; resizing happens while holding that mutex. This is a **single lock for the whole store**, not per-bucket locking.
+
+`kv_get()` returns a newly allocated `kv_blob` containing a **copy** of the value. Callers must release it with `kv_blob_free()`. This prevents a worker from retaining a pointer into storage that another thread could replace, and lets the worker send the reply **after releasing the storage lock**.
+
+`kv_destroy()` is only safe after no worker can access the store. The server arranges that ordering during shutdown.
+
+## 6. Expiration
+
+For `SET key value PX duration`, the dispatcher obtains milliseconds from `CLOCK_MONOTONIC` using checked 64-bit arithmetic. The KV layer stores `expire_at_ms = now_ms + duration` and rejects zero or overflowing TTLs.
+
+`GET` supplies the current monotonic timestamp. If `now_ms >= expire_at_ms`, the key is deleted and reported as absent. This is **lazy expiration**: there is no timer thread or background eviction process. Consequently, expired entries can continue consuming memory until accessed or replaced.
+
+## 7. Thread lifetime and graceful shutdown
+
+Each worker owns its accepted socket descriptor, its `threadArgs` allocation, and its per-client RESP reader. All workers share `KV *kv`.
+
+Normal worker exit follows this path:
+
+```text
+resp_reader_next()
+  -> clean EOF, malformed/truncated request, read failure,
+     or failed response send
+  -> break request loop
+  -> resp_reader_free()
+  -> releaseClient() [unregister + close socket + free args]
+  -> return from threadMain()
+```
+
+`active_clients` is a linked list protected by `clients_mutex`. A client is registered **before** its worker thread is created; if thread creation fails, the main thread unregisters and closes it.
+
+### Shutdown sequence
+
+1. A `SIGINT` or `SIGTERM` handler sets a `volatile sig_atomic_t` shutdown flag. It does not call locking or cleanup functions from signal context.
+2. The main thread normally blocks these signals, temporarily unblocking them **atomically during `pselect()`**. Worker threads inherit the blocked signal mask.
+3. After shutdown is requested, the listening loop ends and the main thread closes the listener.
+4. `drainClients()` locks the client registry, calls `shutdown(fd, SHUT_RDWR)` on each active socket, then waits on `clients_empty` until the registry is empty.
+5. A blocked worker's socket read can finish because of shutdown. Each worker runs its cleanup and `releaseClient()`. The last unregistering worker signals the condition variable.
+6. Once workers have unregistered and no longer use the shared store, the main thread destroys `KV` and exits.
+
+`pthread_cond_wait()` atomically releases the registry mutex while waiting, allowing workers to unregister; it reacquires that mutex before returning. Socket **shutdown** is used to wake I/O, while socket **close** remains coordinated with worker release to avoid file-descriptor-reuse races.
+
+This design coordinates shutdown rather than forcibly canceling worker threads. It has been exercised with idle clients and process signals, but is not a formal proof of race freedom.
+
+## 8. Tests and verification
+
+The build and tests are in the root `Makefile` and `tests/`.
 
 ```sh
 make
-```
-
-This produces `cedis-dev`.
-
-For a build with stricter compiler diagnostics:
-
-```sh
-make clean
-make CFLAGS="-std=gnu11 -Wall -Wextra -Wpedantic -Werror -g -O0"
-```
-
-A compatibility build target is also available:
-
-```sh
-make server
-```
-
-This produces `server.exe`.
-
-## Run
-
-Start the server on the default port, 6379:
-
-```sh
-./cedis-dev
-```
-
-Or specify a port:
-
-```sh
-./cedis-dev --port 6381
-```
-
-In another terminal:
-
-```sh
-redis-cli -p 6381 PING
-redis-cli -p 6381 ECHO hello
-redis-cli -p 6381 SET greeting world
-redis-cli -p 6381 GET greeting
-redis-cli -p 6381 SET temporary value PX 2000
-redis-cli -p 6381 GET temporary
-```
-
-Press Ctrl+C to request graceful shutdown.
-
-The stable build does not support replication. Passing `--replicaof`
-produces an explicit error.
-
-## Architecture
-
-```text
-                   TCP clients
-                       |
-                       v
-               Listening socket
-                       |
-                  pselect()
-                       |
-                    accept()
-                       |
-               Client worker thread
-                       |
-                 RESP reader
-                       |
-                RESP2 parser
-                       |
-               Command dispatcher
-                       |
-                Shared KV store
-                       |
-             Mutex-protected buckets
-```
-
-### Protocol handling
-
-Each client has a receive buffer. The RESP reader accumulates bytes
-from the socket and parses complete requests.
-
-The parser supports arrays of bulk-string arguments. It handles
-fragmented requests, multiple pipelined requests, and binary payloads.
-
-### Storage
-
-The custom key-value store uses FNV-1a hashing, separate chaining,
-and dynamic resizing.
-
-Keys and values are stored with explicit lengths. Setting an existing
-key replaces its value.
-
-The store uses a mutex to synchronize concurrent operations.
-
-### Expiration
-
-`SET ... PX` records an expiration deadline using a monotonic clock.
-
-Expiration is lazy: expired entries are detected and removed when
-accessed. There is no background expiration worker.
-
-### Concurrency and shutdown
-
-Cedis uses a detached POSIX thread for each client.
-
-The main thread maintains a registry of active clients. During
-shutdown, it interrupts their socket operations and waits for
-workers to release their resources before destroying shared storage.
-
-Signal handling and `pselect()` coordinate server termination
-without relying on an indefinitely blocked `accept()` call.
-
-## Tests
-
-Run unit and lifecycle tests:
-
-```sh
 make test
 ```
 
-The test suite covers RESP parsing, socket readers, key-value storage,
-concurrent dictionary operations, and graceful process shutdown.
+`make test` runs four unit-test executables (RESP parser, RESP reader, KV storage, multithreaded KV access) and a Python process-lifecycle suite. The lifecycle tests cover `SIGINT`, `SIGTERM`, an idle client, and a second process failing to bind the occupied port.
 
-Additional integration tests exercise a running server on port 6381.
-
-First start:
+The following integration scripts currently expect a separately running server on port `6381`:
 
 ```sh
 ./cedis-dev --port 6381
-```
-
-Then, in another terminal:
-
-```sh
+# In another terminal:
 python3 tests/test_server_smoke.py
 python3 tests/test_server_integration.py
 python3 tests/test_connections.py
 python3 tests/test_server_errors.py
 ```
 
-These cover request fragmentation, pipelining, binary data, expiration,
-concurrent requests, malformed input, and repeated client connections.
+They exercise pipelining, fragmentation, binary payloads, TTL, concurrent clients, connection churn, malformed frames, and recovery after bad requests. Sanitizer-enabled builds and lifecycle tests have also passed with AddressSanitizer and UndefinedBehaviorSanitizer in the development environment. These tests do not establish production security or the absence of every race.
 
-### Sanitizers
+## 9. Current boundaries and future work
 
-Build with AddressSanitizer and UndefinedBehaviorSanitizer:
+Cedis deliberately remains a narrow educational server:
 
-```sh
-make clean
-make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
-make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer" test
-```
+- In-memory only: no persistence or recovery after restart.
+- A subset of RESP2 requests and only four command names; not Redis-compatible in general.
+- No authentication, TLS, or isolation between users. The listener binds to all IPv4 interfaces; **do not expose the server to untrusted networks**.
+- Unbounded thread-per-client design, no configured connection or memory budget, and a single global storage mutex.
+- The listening loop uses `fd_set`/`pselect()`; its implementation assumes the listening descriptor is within `FD_SETSIZE`.
+- Startup/error-path cleanup and wider adversarial/fault-injection testing remain worthwhile improvements.
+- Replication experiments are isolated on `codecrafters/replication-baseline`; the stable build rejects `--replicaof`.
 
-The core tests and lifecycle tests have been exercised with these
-sanitizers. This does not constitute a guarantee of memory safety or
-freedom from concurrency defects.
+See [known limitations](limitations.md) for actionable follow-up work and [roadmap](roadmap.md) for project priorities.
 
-## Limitations
+## 10. Source map
 
-- Only a small subset of Redis commands is implemented.
-- Request parsing supports flat RESP2 arrays of bulk strings, not
-  the complete RESP2 or RESP3 protocols.
-- Storage is entirely in memory; no persistence is implemented.
-- Expiration is lazy rather than actively scheduled.
-- The thread-per-client architecture does not impose a strict
-  concurrency limit.
-- Replication, transactions, authentication, clustering, and
-  pub/sub are not supported in the stable build.
-- The server is intended for local experimentation, not deployment
-  on untrusted networks.
-
-## Project history
-
-Cedis originated in the CodeCrafters Redis challenge. Earlier
-experiments included replica handshake and synchronization logic.
-
-That unfinished work is preserved in the
-`codecrafters/replication-baseline` branch for future development.
-
-The stable implementation focuses on a smaller, tested core.
-
-## Documentation
-
-- [Architecture](docs/architecture.md)
-- [Known limitations](docs/limitations.md)
-- [Development roadmap](docs/roadmap.md)
-
-## Acknowledgment
-
-The original project direction comes from the
-[CodeCrafters Redis challenge](https://codecrafters.io/challenges/redis).
-
-Redis is a separate project. Cedis is an independent educational
-implementation.
+| Path | Responsibility |
+| --- | --- |
+| `server.c` | CLI, socket setup, `pselect()`/accept loop, worker lifecycle, command dispatch, reply writing |
+| `utils/resp.h`, `utils/resp.c` | Request representation, bounded RESP parsing, request ownership |
+| `utils/resp_stream.h`, `utils/resp_stream.c` | Growable per-client receive buffer |
+| `utils/resp_reader.h`, `utils/resp_reader.c` | Blocking socket reader; request framing and connection statuses |
+| `utils/kv.h`, `utils/kv.c` | Binary-safe, mutex-protected in-memory hash table and TTL |
+| `tests/` | Unit, protocol, concurrency, error-handling, and process lifecycle tests |
+| `Makefile` | Development and compatibility binaries, unit and lifecycle test targets |
