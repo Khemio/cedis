@@ -1,4 +1,9 @@
 .vscode/
 
-
 *.exe
+cedis-dev
+test-resp
+test-resp-reader
+test-kv
+test-kv-threads
+test-dict
