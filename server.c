@@ -12,6 +12,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <signal.h>
 
 #include "utils/kv.h"
 #include "utils/parser.h"
@@ -54,12 +55,85 @@ typedef struct Info {
 	entrie *entries;
 } *Info;
 
-typedef struct {
+typedef struct threadArgs {
     int clnt_sock;
     Dict store;
     Info info;
     KV *kv;
+
+    struct threadArgs *next;
 } threadArgs;
+
+
+static pthread_mutex_t clients_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_cond_t clients_empty =
+    PTHREAD_COND_INITIALIZER;
+
+static threadArgs *active_clients = NULL;
+
+static volatile sig_atomic_t stop_requested = 0;
+
+static void handleStopSignal(int signum) {
+    (void)signum;
+    stop_requested = 1;
+}
+
+static void registerClient(threadArgs *args) {
+    pthread_mutex_lock(&clients_mutex);
+
+    args->next = active_clients;
+    active_clients = args;
+
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+static void releaseClient(threadArgs *args) {
+    pthread_mutex_lock(&clients_mutex);
+
+    threadArgs **slot = &active_clients;
+
+    while (*slot != NULL && *slot != args)
+        slot = &(*slot)->next;
+
+    if (*slot == NULL)
+        abort(); // Internal ownership error.
+
+    *slot = args->next;
+
+    // Main cannot shut down an fd while it is being
+    // closed and potentially reused by another client.
+    close(args->clnt_sock);
+
+    if (active_clients == NULL)
+        pthread_cond_signal(&clients_empty);
+
+    pthread_mutex_unlock(&clients_mutex);
+
+    free(args);
+}
+
+static void drainClients(void) {
+    pthread_mutex_lock(&clients_mutex);
+
+    // Wake workers blocked in recv().
+    for (threadArgs *client = active_clients;
+         client != NULL;
+         client = client->next) {
+
+        shutdown(client->clnt_sock, SHUT_RDWR);
+    }
+
+    while (active_clients != NULL)
+        pthread_cond_wait(
+            &clients_empty,
+            &clients_mutex
+        );
+
+    pthread_mutex_unlock(&clients_mutex);
+}
+
 
 int createServer(int port);
 int acceptCon(int server_sock);
@@ -182,6 +256,52 @@ Info initSlave(void) {
 
 	return info;
 }
+
+
+static void freeInfo(Info info) {
+    if (info == NULL)
+        return;
+
+    if (info->entries != NULL) {
+        for (int i = 0; i < info->size; i++) {
+            entrie *entry = &info->entries[i];
+
+            free(entry->key);
+
+            switch (entry->typeCode) {
+                case TYPE_STRING:
+                    free(entry->value.str);
+                    break;
+
+                case TYPE_LIST: {
+                    list l = entry->value.lt;
+
+                    if (l == NULL)
+                        break;
+
+                    node current = l->head;
+
+                    while (current != NULL) {
+                        node next = current->next;
+                        free(current);
+                        current = next;
+                    }
+
+                    free(l);
+                    break;
+                }
+
+                case TYPE_INT:
+                    break;
+            }
+        }
+
+        free(info->entries);
+    }
+
+    free(info);
+}
+
 
 int connectToMaster(int *master_sock, const char *address, const int port) {
 	int reuse = REUSE;
@@ -354,9 +474,24 @@ int main(int argc, char** argv) {
 		return EXIT_FAILURE;
 	}
 
+	struct sigaction action = {0};
+	action.sa_handler = handleStopSignal;
+	sigemptyset(&action.sa_mask);
+
+	// No SA_RESTART: allow a signal to interrupt accept().
+	if (sigaction(SIGINT, &action, NULL) < 0 ||
+		sigaction(SIGTERM, &action, NULL) < 0) {
+		perror("sigaction");
+		return EXIT_FAILURE;
+	}
+
+	sigset_t stop_signals;
+	sigemptyset(&stop_signals);
+	sigaddset(&stop_signals, SIGINT);
+	sigaddset(&stop_signals, SIGTERM);
 
 	
-	for (;;) {
+	while (!stop_requested) {
 		int client_sock = acceptCon(server_sock);
 
 		if (client_sock < 0) {
@@ -364,7 +499,12 @@ int main(int argc, char** argv) {
 				continue;
 
 			perror("accept");
-			exit(EXIT_FAILURE);
+			break;
+		}
+
+		if (stop_requested) {
+			close(client_sock);
+			break;
 		}
 
 		threadArgs *args = malloc(sizeof *args);
@@ -382,7 +522,23 @@ int main(int argc, char** argv) {
 			.kv = kv
 		};
 
+		registerClient(args);
+
+		
 		pthread_t thread_id;
+		sigset_t previous_mask;
+
+		// Workers inherit blocked shutdown signals.
+		int mask_rc = pthread_sigmask(
+			SIG_BLOCK, &stop_signals, &previous_mask
+		);
+
+		if (mask_rc != 0) {
+			fprintf(stderr, "pthread_sigmask: %s\n",
+					strerror(mask_rc));
+			releaseClient(args);
+			break;
+		}
 
 		int rc = pthread_create(
 			&thread_id,
@@ -391,23 +547,42 @@ int main(int argc, char** argv) {
 			args
 		);
 
+		// Restore the main thread's signal mask.
+		mask_rc = pthread_sigmask(
+			SIG_SETMASK, &previous_mask, NULL
+		);
+
+		if (mask_rc != 0)
+			abort();
+
 		if (rc != 0) {
 			fprintf(stderr, "pthread_create: %s\n",
 					strerror(rc));
 
-			free(args);
-			close(client_sock);
+			releaseClient(args);
 			continue;
 		}
 
 		// The worker now owns args and client_sock.
 	}
-
 	
+	printf("Stopping server...\n");
+
 	close(server_sock);
+
+	drainClients();
+
+	pthread_attr_destroy(&worker_attr);
+
+	// All client workers have finished.
+	freeInfo(info);
+
+	// No worker can access KV after drainClients().
+	kv_destroy(kv);
 	DictDestroy(store);
 
-	return 0;
+	printf("Server stopped.\n");
+	return EXIT_SUCCESS;
 }
 
 int createServer(int port) {
@@ -490,11 +665,7 @@ static int sendAll(int fd, const void *data, size_t len) {
 }
 
 
-static int sendBulk(
-    int fd,
-    const void *data,
-    size_t len
-) {
+static int sendBulk(int fd, const void *data, size_t len) {
     char header[64];
 
     int n = snprintf(
@@ -518,10 +689,7 @@ static int sendBulk(
 }
 
 
-static int commandEquals(
-    const struct resp_arg *arg,
-    const char *name
-) {
+static int commandEquals(const struct resp_arg *arg, const char *name) {
     size_t name_len = strlen(name);
 
     if (arg->len != name_len) {
@@ -563,10 +731,7 @@ static int monotonicMillis(uint64_t *out) {
 }
 
 
-static int parsePositiveU64(
-    const struct resp_arg *arg,
-    uint64_t *out
-) {
+static int parsePositiveU64(const struct resp_arg *arg, uint64_t *out) {
     if (arg->len == 0) {
         return -1;
     }
@@ -758,8 +923,6 @@ void *threadMain(void *raw_args) {
     int client_sock = args->clnt_sock;
 	KV *kv = args->kv;
 
-    free(args);
-
     struct resp_reader reader = {
         .fd = client_sock
     };
@@ -792,7 +955,7 @@ void *threadMain(void *raw_args) {
     }
 
     resp_reader_free(&reader);
-    close(client_sock);
+	releaseClient(args);
 
     return NULL;
 }
