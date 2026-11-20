@@ -1,131 +1,247 @@
+
 # Cedis
 
-**Cedis** is an educational, Redis-inspired TCP key-value server written in C. It explores how a networked in-memory database works below the application level: socket programming, request parsing, hash tables, expiration metadata, and early replication mechanics.
+Cedis is an educational, Redis-inspired in-memory key-value server
+written in C. It implements a subset of the Redis Serialization
+Protocol (RESP2) over TCP, with custom storage, expiration, and
+concurrent client handling.
 
-The project grew out of the [CodeCrafters Redis challenge](https://codecrafters.io/challenges/redis). It is a learning implementation, **not a drop-in Redis replacement** or a production-ready database.
+The project began as an implementation of the CodeCrafters Redis
+challenge and has since been refactored to emphasize correctness,
+memory ownership, networking, and concurrency.
 
-## At a glance
+Cedis is not a production-ready database or a drop-in Redis
+replacement.
 
-- **Language:** C
-- **Networking:** POSIX TCP sockets; a POSIX thread is created for each accepted client
-- **Protocol:** a limited, custom parser and serializer for Redis Serialization Protocol (RESP)-style requests and replies
-- **Storage:** custom in-memory hash table with separate chaining, FNV-1a hashing, and resizing
-- **Expiration:** `SET ... PX` metadata with lazy expiration checked during `GET`
-- **Replication:** experimental handshake and command-forwarding code; incomplete and not suitable for reliable replication
+## Features
 
-## Implemented command paths
+- Binary-safe keys and values
+- Incremental RESP2 request parsing
+- TCP fragmentation and request pipelining
+- Custom hash table using FNV-1a hashing and separate chaining
+- Key replacement and dynamic hash-table resizing
+- Millisecond TTL support with lazy expiration
+- Concurrent clients using POSIX threads
+- Mutex-protected shared key-value storage
+- Graceful shutdown through SIGINT and SIGTERM
+- Automated unit, integration, and lifecycle tests
 
-| Command | Current behavior | Important qualification |
-| --- | --- | --- |
-| `PING` | Replies `PONG` | Basic form only |
-| `ECHO message` | Returns a bulk-string response | Parser changes argument text to lowercase |
-| `SET key value` | Inserts a string entry and replies `OK` in master mode | Repeated keys are *not* replaced in place; the newest entry shadows older ones |
-| `SET key value PX milliseconds` | Stores expiration metadata | Expiration math currently has integer-width issues |
-| `GET key` | Retrieves a string value or returns a null bulk string | Checks expiration on access; behavior is not fully Redis-compatible |
-| `INFO replication` | Generates basic role/replication metadata | Metadata generation needs memory-safety fixes |
-| `REPLCONF`, `PSYNC` | Contains initial replica-handshake and synchronization responses | Prototype only; do not treat as working end-to-end replication |
+### Supported commands
 
-These are the paths present in the source, not a claim of complete Redis command or RESP compliance. In particular, Redis lists, transactions, persistence, authentication, and clustering are **not implemented**.
+| Command | Behavior |
+| --- | --- |
+| `PING` | Returns `PONG` |
+| `ECHO message` | Returns the message as a bulk string |
+| `SET key value` | Creates or replaces a key |
+| `SET key value PX milliseconds` | Sets a key with an expiration time |
+| `GET key` | Returns the value or a null bulk string |
 
-## Build and run
+Command names are case-insensitive. Keys and values retain their
+original bytes.
 
-### Requirements
+## Requirements
 
-- GCC and GNU Make
-- POSIX socket and pthread support (for example, a Linux environment or WSL)
-- Optional: `redis-cli` for trying simple commands
+- Linux or a compatible POSIX environment (tested in WSL2)
+- GCC
+- GNU Make
+- Python 3 for integration tests
+- Optional: `redis-cli`
 
-Build from the repository root:
+## Build
+
+From the repository root:
 
 ```sh
 make
 ```
 
-The current Makefile produces an executable named `server.exe` even on Linux. Start it with the default port (`6379`):
+This produces `cedis-dev`.
+
+For a build with stricter compiler diagnostics:
 
 ```sh
-./server.exe
+make clean
+make CFLAGS="-std=gnu11 -Wall -Wextra -Wpedantic -Werror -g -O0"
 ```
 
-Or choose a port:
+A compatibility build target is also available:
 
 ```sh
-./server.exe --port 6380
+make server
 ```
 
-In another terminal, try the basic command paths:
+This produces `server.exe`.
+
+## Run
+
+Start the server on the default port, 6379:
 
 ```sh
-redis-cli -p 6380 PING
-redis-cli -p 6380 ECHO hello
-redis-cli -p 6380 SET greeting world
-redis-cli -p 6380 GET greeting
-redis-cli -p 6380 SET short lived PX 2000
-redis-cli -p 6380 GET short
+./cedis-dev
 ```
 
-**Note:** Keep test inputs small and simple. The current parser assumes a request fits in a single `recv()` call, has a 256-byte receive buffer, and normalizes *all* arguments to lowercase. It is not binary-safe or suitable for adversarial input. `PX` is implemented but its timing behavior is not yet reliable.
+Or specify a port:
 
-The repository also includes [`test_commands.txt`](test_commands.txt), containing example raw RESP requests sent using `nc`. These are manual examples, not an automated test suite.
-
-## How it works
-
-```mermaid
-flowchart LR
-    A[Client] -->|TCP / RESP-style bytes| B[Socket listener]
-    B --> C[Per-client pthread]
-    C --> D[Request parser]
-    D --> E[Command dispatcher]
-    E --> F[Custom hash table]
-    F --> G[Key / value / expiry metadata]
-    E -->|RESP-style response| A
+```sh
+./cedis-dev --port 6381
 ```
 
-1. The server listens on a configurable TCP port and accepts connections.
-2. Each accepted connection receives its own handler thread, while threads share a single dictionary instance.
-3. A custom parser tokenizes the received request into command arguments.
-4. The command dispatcher performs operations against the hash table and writes a protocol response.
-5. `GET` checks expiration metadata and can delete an expired entry on access.
+In another terminal:
 
-The store starts with **1,024 buckets**, uses **64-bit FNV-1a** to choose a bucket, resolves collisions with **separate chaining**, and doubles the bucket array when its entry count reaches the configured load-factor threshold. Insertion is currently append-by-prepending rather than true replacement for an existing key.
+```sh
+redis-cli -p 6381 PING
+redis-cli -p 6381 ECHO hello
+redis-cli -p 6381 SET greeting world
+redis-cli -p 6381 GET greeting
+redis-cli -p 6381 SET temporary value PX 2000
+redis-cli -p 6381 GET temporary
+```
 
-For code-level detail, see [Architecture](docs/architecture.md).
+Press Ctrl+C to request graceful shutdown.
 
-## Repository layout
+The stable build does not support replication. Passing `--replicaof`
+produces an explicit error.
+
+## Architecture
 
 ```text
-.
-├── Makefile                 # Build server.exe
-├── server.c                 # Sockets, threading, commands, replication experiments
-├── test_commands.txt       # Manual wire-format examples
-└── utils/
-    ├── dict.c / dict.h     # Hash table and expiration fields
-    ├── parser.c / parser.h # Request tokenization
-    └── timing.c / timing.h # Wall-clock milliseconds helper
+                   TCP clients
+                       |
+                       v
+               Listening socket
+                       |
+                  pselect()
+                       |
+                    accept()
+                       |
+               Client worker thread
+                       |
+                 RESP reader
+                       |
+                RESP2 parser
+                       |
+               Command dispatcher
+                       |
+                Shared KV store
+                       |
+             Mutex-protected buckets
 ```
 
-## Current status and limitations
+### Protocol handling
 
-Cedis is best understood as a **systems-programming prototype**. The architecture demonstrates useful concepts, but the current source contains outstanding correctness, concurrency, protocol-framing, memory-management, and replication issues. In particular:
+Each client has a receive buffer. The RESP reader accumulates bytes
+from the socket and parses complete requests.
 
-- Shared dictionary operations are not synchronized across client threads.
-- Duplicate `SET` operations create multiple entries for the same key.
-- The parser does not handle fragmented or combined TCP requests correctly, and it lowercases values as well as command names.
-- Some code paths have memory-safety and cleanup defects; disconnect handling is incomplete.
-- The replication path contains incomplete initialization and protocol handling.
+The parser supports arrays of bulk-string arguments. It handles
+fragmented requests, multiple pipelined requests, and binary payloads.
 
-See [Known limitations and suggested fixes](docs/limitations.md) for specific, source-backed examples and a remediation order. The example commands above are illustrative, **not evidence of a fully verified or safe build**.
+### Storage
 
-## Why this project
+The custom key-value store uses FNV-1a hashing, separate chaining,
+and dynamic resizing.
 
-Cedis is a hands-on exploration of systems programming in C: designing a hash table rather than using a library, encoding and decoding network messages, managing allocation and ownership, and seeing how protocol semantics interact with concurrency and time. It also provides a concrete foundation for improving correctness through tests, safer parsing, and a clearer execution model.
+Keys and values are stored with explicit lengths. Setting an existing
+key replaces its value.
+
+The store uses a mutex to synchronize concurrent operations.
+
+### Expiration
+
+`SET ... PX` records an expiration deadline using a monotonic clock.
+
+Expiration is lazy: expired entries are detected and removed when
+accessed. There is no background expiration worker.
+
+### Concurrency and shutdown
+
+Cedis uses a detached POSIX thread for each client.
+
+The main thread maintains a registry of active clients. During
+shutdown, it interrupts their socket operations and waits for
+workers to release their resources before destroying shared storage.
+
+Signal handling and `pselect()` coordinate server termination
+without relying on an indefinitely blocked `accept()` call.
+
+## Tests
+
+Run unit and lifecycle tests:
+
+```sh
+make test
+```
+
+The test suite covers RESP parsing, socket readers, key-value storage,
+concurrent dictionary operations, and graceful process shutdown.
+
+Additional integration tests exercise a running server on port 6381.
+
+First start:
+
+```sh
+./cedis-dev --port 6381
+```
+
+Then, in another terminal:
+
+```sh
+python3 tests/test_server_smoke.py
+python3 tests/test_server_integration.py
+python3 tests/test_connections.py
+python3 tests/test_server_errors.py
+```
+
+These cover request fragmentation, pipelining, binary data, expiration,
+concurrent requests, malformed input, and repeated client connections.
+
+### Sanitizers
+
+Build with AddressSanitizer and UndefinedBehaviorSanitizer:
+
+```sh
+make clean
+make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
+make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer" test
+```
+
+The core tests and lifecycle tests have been exercised with these
+sanitizers. This does not constitute a guarantee of memory safety or
+freedom from concurrency defects.
+
+## Limitations
+
+- Only a small subset of Redis commands is implemented.
+- Request parsing supports flat RESP2 arrays of bulk strings, not
+  the complete RESP2 or RESP3 protocols.
+- Storage is entirely in memory; no persistence is implemented.
+- Expiration is lazy rather than actively scheduled.
+- The thread-per-client architecture does not impose a strict
+  concurrency limit.
+- Replication, transactions, authentication, clustering, and
+  pub/sub are not supported in the stable build.
+- The server is intended for local experimentation, not deployment
+  on untrusted networks.
+
+## Project history
+
+Cedis originated in the CodeCrafters Redis challenge. Earlier
+experiments included replica handshake and synchronization logic.
+
+That unfinished work is preserved in the
+`codecrafters/replication-baseline` branch for future development.
+
+The stable implementation focuses on a smaller, tested core.
 
 ## Documentation
 
-- [Architecture and implementation notes](docs/architecture.md)
-- [Known limitations and suggested improvements](docs/limitations.md)
-- [Roadmap and issue-sized tasks](docs/roadmap.md)
+- [Architecture](docs/architecture.md)
+- [Known limitations](docs/limitations.md)
+- [Development roadmap](docs/roadmap.md)
 
 ## Acknowledgment
 
-The initial project direction comes from the [CodeCrafters Redis challenge](https://codecrafters.io/challenges/redis). Redis is a separate project; Cedis is an independent educational implementation.
+The original project direction comes from the
+[CodeCrafters Redis challenge](https://codecrafters.io/challenges/redis).
+
+Redis is a separate project. Cedis is an independent educational
+implementation.
