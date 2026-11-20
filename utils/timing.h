@@ -1,1 +1,0 @@
-long time_mili(void);

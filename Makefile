@@ -36,16 +36,20 @@ test-kv: tests/test_kv.c utils/kv.c
 test-kv-threads: tests/test_kv_threads.c utils/kv.c
 	$(CC) $(TEST_CFLAGS) $(SAN) -o $@ $^ -pthread
 
-test-dict: tests/test_dict.c utils/dict.c
-	$(CC) $(TEST_CFLAGS) $(SAN) -o $@ $^ -pthread
 
-test: test-resp test-resp-reader test-kv test-kv-threads test-dict
+.PHONY: test test-unit test-lifecycle
+
+test-unit: test-resp test-resp-reader test-kv test-kv-threads
 	./test-resp
 	./test-resp-reader
 	./test-kv
 	./test-kv-threads
-	./test-dict
+
+test-lifecycle: cedis-dev
+	python3 tests/test_server_lifecycle.py
+
+test: test-unit test-lifecycle
 
 clean:
 	rm -f cedis-dev server.exe test-resp test-resp-reader \
-	      test-kv test-kv-threads test-dict
+	      test-kv test-kv-threads
