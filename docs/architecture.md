@@ -1,139 +1,247 @@
-# Cedis architecture and implementation notes
 
-> **Source reference:** [`Khemio/cedis`](https://github.com/Khemio/cedis), `main` branch inspected on 2026-11-13. This document describes the implementation *as written*, including unfinished functionality.
+# Cedis
 
-## 1. Overall design
+Cedis is an educational, Redis-inspired in-memory key-value server
+written in C. It implements a subset of the Redis Serialization
+Protocol (RESP2) over TCP, with custom storage, expiration, and
+concurrent client handling.
 
-Cedis is a TCP server with an in-memory string-to-string dictionary. `server.c` holds connection handling, a command dispatcher, and experimental replication-related code. `utils/` contains the dictionary, request parser, and a wall-clock time helper.
+The project began as an implementation of the CodeCrafters Redis
+challenge and has since been refactored to emphasize correctness,
+memory ownership, networking, and concurrency.
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Listener as TCP listener
-    participant Worker as Client pthread
-    participant Parser as parseReq
-    participant Handler as handleReq
-    participant Store as Dict
-    Client->>Listener: Connect
-    Listener->>Worker: pthread_create(socket, shared store)
-    Client->>Worker: Request bytes
-    Worker->>Parser: parseReq(buffer, recvSize)
-    Parser-->>Worker: Command and arguments
-    Worker->>Handler: handleReq(request, store, info)
-    Handler->>Store: Insert / search / delete
-    Store-->>Handler: Stored value or status
-    Handler-->>Client: RESP-style reply
+Cedis is not a production-ready database or a drop-in Redis
+replacement.
+
+## Features
+
+- Binary-safe keys and values
+- Incremental RESP2 request parsing
+- TCP fragmentation and request pipelining
+- Custom hash table using FNV-1a hashing and separate chaining
+- Key replacement and dynamic hash-table resizing
+- Millisecond TTL support with lazy expiration
+- Concurrent clients using POSIX threads
+- Mutex-protected shared key-value storage
+- Graceful shutdown through SIGINT and SIGTERM
+- Automated unit, integration, and lifecycle tests
+
+### Supported commands
+
+| Command | Behavior |
+| --- | --- |
+| `PING` | Returns `PONG` |
+| `ECHO message` | Returns the message as a bulk string |
+| `SET key value` | Creates or replaces a key |
+| `SET key value PX milliseconds` | Sets a key with an expiration time |
+| `GET key` | Returns the value or a null bulk string |
+
+Command names are case-insensitive. Keys and values retain their
+original bytes.
+
+## Requirements
+
+- Linux or a compatible POSIX environment (tested in WSL2)
+- GCC
+- GNU Make
+- Python 3 for integration tests
+- Optional: `redis-cli`
+
+## Build
+
+From the repository root:
+
+```sh
+make
 ```
 
-The listener accepts clients in an indefinite loop. A new pthread runs `threadMain` for each connection. All worker threads receive the same `Dict` pointer and replication metadata pointer; there is no mutex around shared state.
+This produces `cedis-dev`.
 
-**Important:** The worker loop currently continues when `recv()` returns zero or an error. Normal connection teardown and allocation cleanup are not properly completed.
+For a build with stricter compiler diagnostics:
 
-## 2. Storage engine: `utils/dict.c`
+```sh
+make clean
+make CFLAGS="-std=gnu11 -Wall -Wextra -Wpedantic -Werror -g -O0"
+```
 
-### Layout
+A compatibility build target is also available:
 
-The dictionary owns an array of bucket pointers. Each bucket is the head of a linked list of entries:
+```sh
+make server
+```
+
+This produces `server.exe`.
+
+## Run
+
+Start the server on the default port, 6379:
+
+```sh
+./cedis-dev
+```
+
+Or specify a port:
+
+```sh
+./cedis-dev --port 6381
+```
+
+In another terminal:
+
+```sh
+redis-cli -p 6381 PING
+redis-cli -p 6381 ECHO hello
+redis-cli -p 6381 SET greeting world
+redis-cli -p 6381 GET greeting
+redis-cli -p 6381 SET temporary value PX 2000
+redis-cli -p 6381 GET temporary
+```
+
+Press Ctrl+C to request graceful shutdown.
+
+The stable build does not support replication. Passing `--replicaof`
+produces an explicit error.
+
+## Architecture
 
 ```text
-Dict
- ├─ size: bucket count (initially 1024)
- ├─ n: number of inserted entries
- └─ table: array of linked-list heads
-        ├─ bucket 0 -> entry -> entry -> NULL
-        ├─ bucket 1 -> NULL
-        └─ ...
-
-entry = { key, value, expiry, expire_at, next }
+                   TCP clients
+                       |
+                       v
+               Listening socket
+                       |
+                  pselect()
+                       |
+                    accept()
+                       |
+               Client worker thread
+                       |
+                 RESP reader
+                       |
+                RESP2 parser
+                       |
+               Command dispatcher
+                       |
+                Shared KV store
+                       |
+             Mutex-protected buckets
 ```
 
-- **Hash function:** 64-bit FNV-1a over null-terminated key bytes.
-- **Bucket selection:** `hash_function(key) % d->size`.
-- **Collision resolution:** separate chaining with singly linked lists.
-- **Insertion:** allocates an entry, duplicates the key/value strings, and prepends the entry to its bucket.
-- **Lookup:** walks the selected chain and returns the first matching key (the most recently inserted match).
-- **Deletion:** unlinks the first matching entry.
-- **Growth:** when `n >= size * MAX_LOAD_FACTOR` (threshold configured as `1`), the table doubles and reinserts existing records. This allocates new entry copies instead of moving existing nodes.
+### Protocol handling
 
-These choices aim for expected constant-time lookup and insertion *under a reasonable key distribution*, but the project has no published performance measurements or performance guarantees.
+Each client has a receive buffer. The RESP reader accumulates bytes
+from the socket and parses complete requests.
 
-### Duplicate-key semantics
+The parser supports arrays of bulk-string arguments. It handles
+fragmented requests, multiple pipelined requests, and binary payloads.
 
-`DictInsert` does not detect an existing key. A second `SET` creates another entry that shadows the first. If the newest entry expires and is deleted, an older value can become visible again. This differs from Redis `SET`, which replaces the value associated with a key.
+### Storage
 
-The dictionary's `n` counts inserted entries rather than distinct keys, and `DictDelete` currently does not decrement `n`.
+The custom key-value store uses FNV-1a hashing, separate chaining,
+and dynamic resizing.
 
-## 3. Time-to-live (TTL)
+Keys and values are stored with explicit lengths. Setting an existing
+key replaces its value.
 
-`SET key value PX milliseconds` extracts the millisecond duration and stores an expiry marker. `GET` calls the time helper, checks the marker, and lazily deletes an entry judged expired.
+The store uses a mutex to synchronize concurrent operations.
 
-`utils/timing.c` uses `clock_gettime(CLOCK_REALTIME, ...)` and converts the timestamp to milliseconds. This is **wall-clock** time, not a monotonic clock. There is no dedicated expiration queue or background eviction worker in this revision.
+### Expiration
 
-**Correctness issue:** `time_mili()` returns `long`, but `server.c` assigns that value to `int now`; storing an epoch timestamp in an `int` can overflow or truncate it. Expiration should be considered a proof of concept until integer widths and timing semantics are fixed.
+`SET ... PX` records an expiration deadline using a monotonic clock.
 
-## 4. Request parsing and responses
+Expiration is lazy: expired entries are detected and removed when
+accessed. There is no background expiration worker.
 
-`utils/parser.c` implements `parseReq`, which splits a received message around carriage returns, reads an array count, and creates an array of argument structures (`len` and `val`). The dispatcher in `server.c` compares the command argument against literal command names and sends formatted responses with `send()`.
+### Concurrency and shutdown
 
-Current assumptions and limits:
+Cedis uses a detached POSIX thread for each client.
 
-- A full request is assumed to arrive in one `recv()` call; TCP does not preserve request boundaries.
-- The receive buffer is 256 bytes with no robust accumulation or framing.
-- The RESP array count is extracted from a single character, so counts of 10 or more are not handled correctly.
-- Payloads are processed as null-terminated strings; embedded NUL bytes and arbitrary binary strings are not supported.
-- Every argument is converted to lowercase. Redis command names are case-insensitive, but **keys and values should not be changed**.
-- The implementation handles only a narrow subset of RESP-style arrays and replies, without comprehensive validation of length fields, partial frames, or malformed input.
+The main thread maintains a registry of active clients. During
+shutdown, it interrupts their socket operations and waits for
+workers to release their resources before destroying shared storage.
 
-These constraints are particularly relevant because the code works with byte streams, but its parsing strategy resembles parsing complete text records.
+Signal handling and `pselect()` coordinate server termination
+without relying on an indefinitely blocked `accept()` call.
 
-## 5. Commands
+## Tests
 
-`handleReq` in `server.c` contains explicit branches for the following:
+Run unit and lifecycle tests:
 
-| Command path | Execution |
-| --- | --- |
-| `PING` | Writes a simple `+PONG` response |
-| `ECHO` | Formats the next argument as a bulk string |
-| `SET` | Duplicates argument strings and calls `DictInsert`; replies `+OK` in master mode |
-| `GET` | Calls `DictSearch`, checks expiration metadata, and formats a value or null bulk-string reply |
-| `INFO replication` | Attempts to format role, replication ID, and offset information |
-| `REPLCONF` | Replies to known handshake arguments and tracks replica client sockets |
-| `PSYNC` | Sends a full-resynchronization line and a fixed empty RDB-like payload |
+```sh
+make test
+```
 
-The latter three paths belong to the unfinished replication experiment. They should not be advertised as a complete, reliable feature.
+The test suite covers RESP parsing, socket readers, key-value storage,
+concurrent dictionary operations, and graceful process shutdown.
 
-## 6. Replication experiment
+Additional integration tests exercise a running server on port 6381.
 
-The source has two role initializers:
+First start:
 
-- **Master metadata:** role, a fixed replication ID, replication offset `0`, and a list of connected replica file descriptors.
-- **Replica metadata:** role `slave`.
+```sh
+./cedis-dev --port 6381
+```
 
-The master attempts to answer `REPLCONF` and `PSYNC`, then forward serialized `SET` commands to tracked replica sockets. The replica-side code contains a `PING` → `REPLCONF` → `PSYNC` handshake sequence.
+Then, in another terminal:
 
-However, the replica startup path references the listening socket before its initialization, response parsing is incomplete, and the `listenToMaster` function is empty. Replication offsets, continuous state synchronization, reconnect logic, and robust snapshot transfer are not implemented. The forwarding path does not fully preserve command options such as expiration.
+```sh
+python3 tests/test_server_smoke.py
+python3 tests/test_server_integration.py
+python3 tests/test_connections.py
+python3 tests/test_server_errors.py
+```
 
-These are implementation experiments, **not working replication guarantees**.
+These cover request fragmentation, pipelining, binary data, expiration,
+concurrent requests, malformed input, and repeated client connections.
 
-## 7. Source files and responsibilities
+### Sanitizers
 
-| File | Responsibility |
-| --- | --- |
-| [`server.c`](https://github.com/Khemio/cedis/blob/main/server.c) | TCP listener, client threads, command handling, initial replication code |
-| [`utils/dict.c`](https://github.com/Khemio/cedis/blob/main/utils/dict.c) | Dictionary creation, FNV-1a hashing, insert/search/delete, growth |
-| [`utils/parser.c`](https://github.com/Khemio/cedis/blob/main/utils/parser.c) | Basic RESP-style request tokenization |
-| [`utils/timing.c`](https://github.com/Khemio/cedis/blob/main/utils/timing.c) | Milliseconds based on `CLOCK_REALTIME` |
-| [`Makefile`](https://github.com/Khemio/cedis/blob/main/Makefile) | GCC build with pthread linking |
-| [`test_commands.txt`](https://github.com/Khemio/cedis/blob/main/test_commands.txt) | Raw protocol examples for manual testing |
+Build with AddressSanitizer and UndefinedBehaviorSanitizer:
 
-## 8. Suggested next architecture milestones
+```sh
+make clean
+make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
+make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer" test
+```
 
-1. Replace the token-based parser with a length-aware, incremental RESP decoder and connection input buffer.
-2. Define ownership rules for requests and stored values; eliminate leaks and out-of-bounds operations.
-3. Make dictionary semantics correct: unique keys, replacement behavior, accurate size tracking, and safe deletion.
-4. Replace inconsistent time widths with `int64_t` milliseconds and specify TTL semantics clearly.
-5. Choose a deliberate concurrency strategy (mutex-protected shared store or event-loop architecture) and test it.
-6. Add automated unit and integration tests before extending replication.
-7. Revisit replication only after command execution and protocol framing are trustworthy.
+The core tests and lifecycle tests have been exercised with these
+sanitizers. This does not constitute a guarantee of memory safety or
+freedom from concurrency defects.
 
-See [Known limitations](limitations.md) for concrete issues and priorities.
+## Limitations
+
+- Only a small subset of Redis commands is implemented.
+- Request parsing supports flat RESP2 arrays of bulk strings, not
+  the complete RESP2 or RESP3 protocols.
+- Storage is entirely in memory; no persistence is implemented.
+- Expiration is lazy rather than actively scheduled.
+- The thread-per-client architecture does not impose a strict
+  concurrency limit.
+- Replication, transactions, authentication, clustering, and
+  pub/sub are not supported in the stable build.
+- The server is intended for local experimentation, not deployment
+  on untrusted networks.
+
+## Project history
+
+Cedis originated in the CodeCrafters Redis challenge. Earlier
+experiments included replica handshake and synchronization logic.
+
+That unfinished work is preserved in the
+`codecrafters/replication-baseline` branch for future development.
+
+The stable implementation focuses on a smaller, tested core.
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Known limitations](docs/limitations.md)
+- [Development roadmap](docs/roadmap.md)
+
+## Acknowledgment
+
+The original project direction comes from the
+[CodeCrafters Redis challenge](https://codecrafters.io/challenges/redis).
+
+Redis is a separate project. Cedis is an independent educational
+implementation.
