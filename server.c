@@ -331,24 +331,78 @@ int main(int argc, char** argv) {
 
 	server_sock = createServer(port);
 
-	for (;;) {
-		// TODO: Extract and encapsulate (2)
-		pthread_t threadId;
-		threadArgs *args; 
 
-		client_sock = acceptCon(server_sock);
+	pthread_attr_t worker_attr;
 
-		printf("Client connected\n");
+	int err = pthread_attr_init(&worker_attr);
 
-		if ((args = malloc(sizeof(threadArgs))) == NULL) printf("malloc() fail\n");
-		
-		args->clnt_sock = client_sock;
-		args->store = store;
-		args->info = info;
-		args->kv = kv;
-
-		if (pthread_create(&threadId, NULL, threadMain, args) != 0) printf("phtread_create() fail\n");
+	if (err != 0) {
+		fprintf(stderr, "pthread_attr_init: %s\n",
+				strerror(err));
+		return EXIT_FAILURE;
 	}
+
+	err = pthread_attr_setdetachstate(
+		&worker_attr,
+		PTHREAD_CREATE_DETACHED
+	);
+
+	if (err != 0) {
+		fprintf(stderr, "pthread_attr_setdetachstate: %s\n",
+				strerror(err));
+		pthread_attr_destroy(&worker_attr);
+		return EXIT_FAILURE;
+	}
+
+
+	
+	for (;;) {
+		int client_sock = acceptCon(server_sock);
+
+		if (client_sock < 0) {
+			if (errno == EINTR)
+				continue;
+
+			perror("accept");
+			exit(EXIT_FAILURE);
+		}
+
+		threadArgs *args = malloc(sizeof *args);
+
+		if (args == NULL) {
+			perror("malloc");
+			close(client_sock);
+			continue;
+		}
+
+		*args = (threadArgs){
+			.clnt_sock = client_sock,
+			.store = store,
+			.info = info,
+			.kv = kv
+		};
+
+		pthread_t thread_id;
+
+		int rc = pthread_create(
+			&thread_id,
+			&worker_attr,
+			threadMain,
+			args
+		);
+
+		if (rc != 0) {
+			fprintf(stderr, "pthread_create: %s\n",
+					strerror(rc));
+
+			free(args);
+			close(client_sock);
+			continue;
+		}
+
+		// The worker now owns args and client_sock.
+	}
+
 	
 	close(server_sock);
 	DictDestroy(store);
@@ -396,18 +450,22 @@ int createServer(int port) {
 }
 
 int acceptCon(int server_sock) {
-	int client_sock;
-	socklen_t client_addr_len;
-	struct sockaddr_in client_addr;
-
-	client_addr_len = sizeof(client_addr);
-
-	// Add error handling
-	client_sock = accept(server_sock, (struct sockaddr *) &client_addr, &client_addr_len);
-	if (client_sock < 0) printf("accept() fail\n");
-
-	return client_sock;
+    return accept(server_sock, NULL, NULL);
 }
+
+// int acceptCon(int server_sock) {
+// 	int client_sock;
+// 	socklen_t client_addr_len;
+// 	struct sockaddr_in client_addr;
+
+// 	client_addr_len = sizeof(client_addr);
+
+// 	// Add error handling
+// 	client_sock = accept(server_sock, (struct sockaddr *) &client_addr, &client_addr_len);
+// 	if (client_sock < 0) printf("accept() fail\n");
+
+// 	return client_sock;
+// }
 
 static int sendAll(int fd, const void *data, size_t len) {
     const unsigned char *bytes = data;
