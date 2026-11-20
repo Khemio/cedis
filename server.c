@@ -136,16 +136,7 @@ int main(int argc, char** argv) {
 	int server_sock;
 	int port = 6379;
 
-	if (argc >= 2 && strcmp(argv[1], "--port") == 0) {
-		if (argc < 3 || parsePort(argv[2], &port) < 0) {
-			fprintf(stderr,
-					"Invalid port: expected an integer "
-					"between 1 and 65535\n");
-			return EXIT_FAILURE;
-		}
-	}
-
-
+	// Replication is deliberately unsupported in this build.
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--replicaof") == 0) {
 			fprintf(
@@ -155,6 +146,30 @@ int main(int argc, char** argv) {
 			return EXIT_FAILURE;
 		}
 	}
+
+	if (argc == 1) {
+		// Use the default port.
+	} else if (argc == 3 &&
+			strcmp(argv[1], "--port") == 0) {
+
+		if (parsePort(argv[2], &port) < 0) {
+			fprintf(
+				stderr,
+				"Invalid port: expected an integer "
+				"between 1 and 65535\n"
+			);
+			return EXIT_FAILURE;
+		}
+
+	} else {
+		fprintf(
+			stderr,
+			"Usage: %s [--port <1-65535>]\n",
+			argv[0]
+		);
+		return EXIT_FAILURE;
+	}
+
 
 
 	KV *kv = kv_create();
@@ -172,13 +187,35 @@ int main(int argc, char** argv) {
 	}
 
 
+	if (server_sock >= FD_SETSIZE) {
+		fprintf(
+			stderr,
+			"Listening socket descriptor %d exceeds "
+			"FD_SETSIZE (%d)\n",
+			server_sock,
+			FD_SETSIZE
+		);
+
+		close(server_sock);
+		kv_destroy(kv);
+
+		return EXIT_FAILURE;
+	}
+
+
+
 	pthread_attr_t worker_attr;
 
 	int err = pthread_attr_init(&worker_attr);
 
+
 	if (err != 0) {
 		fprintf(stderr, "pthread_attr_init: %s\n",
 				strerror(err));
+
+		close(server_sock);
+		kv_destroy(kv);
+
 		return EXIT_FAILURE;
 	}
 
@@ -186,11 +223,16 @@ int main(int argc, char** argv) {
 		&worker_attr,
 		PTHREAD_CREATE_DETACHED
 	);
-
+	
 	if (err != 0) {
-		fprintf(stderr, "pthread_attr_setdetachstate: %s\n",
+		fprintf(stderr,
+				"pthread_attr_setdetachstate: %s\n",
 				strerror(err));
+
 		pthread_attr_destroy(&worker_attr);
+		close(server_sock);
+		kv_destroy(kv);
+
 		return EXIT_FAILURE;
 	}
 
@@ -198,20 +240,26 @@ int main(int argc, char** argv) {
 	action.sa_handler = handleStopSignal;
 	sigemptyset(&action.sa_mask);
 
-	// No SA_RESTART: allow a signal to interrupt accept().
+	// SIGINT and SIGTERM request graceful shutdown.
+	// pselect() atomically unblocks them while waiting.
 	if (sigaction(SIGINT, &action, NULL) < 0 ||
 		sigaction(SIGTERM, &action, NULL) < 0) {
+
 		perror("sigaction");
+
+		pthread_attr_destroy(&worker_attr);
+		close(server_sock);
+		kv_destroy(kv);
+
 		return EXIT_FAILURE;
 	}
+
 
 	sigset_t stop_signals;
 	sigemptyset(&stop_signals);
 	sigaddset(&stop_signals, SIGINT);
 	sigaddset(&stop_signals, SIGTERM);
 
-
-	// New
 	sigset_t previous_mask;
 
 	int mask_rc = pthread_sigmask(
