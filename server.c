@@ -11,7 +11,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <ctype.h>
+#include <stdint.h>
 
+#include "utils/kv.h"
 #include "utils/parser.h"
 #include "utils/timing.h"
 #include "utils/dict.h"
@@ -53,9 +55,10 @@ typedef struct Info {
 } *Info;
 
 typedef struct {
-	int clnt_sock;
-	Dict store;
-	Info info;
+    int clnt_sock;
+    Dict store;
+    Info info;
+    KV *kv;
 } threadArgs;
 
 int createServer(int port);
@@ -285,6 +288,13 @@ int main(int argc, char** argv) {
 	Dict store;
 	store = DictCreate();
 
+	KV *kv = kv_create();
+
+	if (kv == NULL) {
+		fprintf(stderr, "Failed to initialize KV store\n");
+		return EXIT_FAILURE;
+	}
+
 	if (argc >= 5 && strcmp(argv[3], "--replicaof") == 0) {
 		info = initSlave();
 		char *address = strtok(argv[4], " ");
@@ -311,6 +321,7 @@ int main(int argc, char** argv) {
 		args->clnt_sock = master_sock;
 		args->store = store;
 		args->info = info;
+		args->kv = kv;
 
 		if (pthread_create(&threadId, NULL, threadMain, args) != 0) printf("phtread_create() fail\n");
 
@@ -334,6 +345,7 @@ int main(int argc, char** argv) {
 		args->clnt_sock = client_sock;
 		args->store = store;
 		args->info = info;
+		args->kv = kv;
 
 		if (pthread_create(&threadId, NULL, threadMain, args) != 0) printf("phtread_create() fail\n");
 	}
@@ -419,6 +431,35 @@ static int sendAll(int fd, const void *data, size_t len) {
     return 0;
 }
 
+
+static int sendBulk(
+    int fd,
+    const void *data,
+    size_t len
+) {
+    char header[64];
+
+    int n = snprintf(
+        header,
+        sizeof header,
+        "$%zu\r\n",
+        len
+    );
+
+    if (n < 0 || (size_t)n >= sizeof header) {
+        return -1;
+    }
+
+    if (sendAll(fd, header, (size_t)n) < 0 ||
+        sendAll(fd, data, len) < 0 ||
+        sendAll(fd, "\r\n", 2) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+
 static int commandEquals(
     const struct resp_arg *arg,
     const char *name
@@ -439,10 +480,71 @@ static int commandEquals(
     return 1;
 }
 
+
+static int monotonicMillis(uint64_t *out) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return -1;
+    }
+
+    if (ts.tv_sec < 0) {
+        return -1;
+    }
+
+    uint64_t seconds = (uint64_t)ts.tv_sec;
+    uint64_t milliseconds =
+        (uint64_t)ts.tv_nsec / 1000000;
+
+    if (seconds > (UINT64_MAX - milliseconds) / 1000) {
+        return -1;
+    }
+
+    *out = seconds * 1000 + milliseconds;
+    return 0;
+}
+
+
+static int parsePositiveU64(
+    const struct resp_arg *arg,
+    uint64_t *out
+) {
+    if (arg->len == 0) {
+        return -1;
+    }
+
+    uint64_t value = 0;
+
+    for (size_t i = 0; i < arg->len; i++) {
+        unsigned char ch = arg->data[i];
+
+        if (ch < '0' || ch > '9') {
+            return -1;
+        }
+
+        uint64_t digit = ch - '0';
+
+        if (value > (UINT64_MAX - digit) / 10) {
+            return -1;
+        }
+
+        value = value * 10 + digit;
+    }
+
+    if (value == 0) {
+        return -1;
+    }
+
+    *out = value;
+    return 0;
+}
+
+
 static int handleRespRequest(
     int client_sock,
-    const struct resp_request *req
-) {
+    const struct resp_request *req,
+    KV *kv
+){
     const struct resp_arg *command = &req->args[0];
 
     if (commandEquals(command, "ping")) {
@@ -464,24 +566,126 @@ static int handleRespRequest(
 
         const struct resp_arg *message = &req->args[1];
 
-        char header[64];
-        int n = snprintf(
-            header, sizeof(header),
-            "$%zu\r\n", message->len
-        );
-
-        if (n < 0 || (size_t)n >= sizeof(header)) {
-            return -1;
-        }
-
-        if (sendAll(client_sock, header, (size_t)n) < 0 ||
-            sendAll(client_sock, message->data, message->len) < 0 ||
-            sendAll(client_sock, "\r\n", 2) < 0) {
-            return -1;
-        }
-
-        return 0;
+		return sendBulk(
+			client_sock,
+			message->data,
+			message->len
+		);
     }
+
+
+	if (commandEquals(command, "get")) {
+		if (req->argc != 2) {
+			const char *err =
+				"-ERR wrong number of arguments for GET\r\n";
+
+			return sendAll(client_sock, err, strlen(err));
+		}
+
+		uint64_t now_ms;
+
+		if (monotonicMillis(&now_ms) < 0) {
+			return -1;
+		}
+
+		const struct resp_arg *key = &req->args[1];
+
+		struct kv_blob value = {0};
+
+		enum kv_status status = kv_get(
+			kv,
+			key->data,
+			key->len,
+			now_ms,
+			&value
+		);
+
+		if (status == KV_NOT_FOUND) {
+			// RESP null bulk string.
+			return sendAll(client_sock, "$-1\r\n", 5);
+		}
+
+		if (status != KV_OK) {
+			const char *err =
+				"-ERR storage operation failed\r\n";
+
+			return sendAll(client_sock, err, strlen(err));
+		}
+
+		int result = sendBulk(
+			client_sock,
+			value.data,
+			value.len
+		);
+
+		kv_blob_free(&value);
+
+		return result;
+	}
+
+
+	if (commandEquals(command, "set")) {
+		if (req->argc != 3 && req->argc != 5) {
+			const char *err =
+				"-ERR wrong number of arguments for SET\r\n";
+
+			return sendAll(client_sock, err, strlen(err));
+		}
+
+		const struct resp_arg *key = &req->args[1];
+		const struct resp_arg *value = &req->args[2];
+
+		enum kv_status status;
+
+		if (req->argc == 5) {
+			if (!commandEquals(&req->args[3], "px")) {
+				const char *err = "-ERR syntax error\r\n";
+				return sendAll(client_sock, err, strlen(err));
+			}
+
+			uint64_t ttl_ms;
+
+			if (parsePositiveU64(&req->args[4], &ttl_ms) < 0) {
+				const char *err =
+					"-ERR invalid expire time in SET\r\n";
+
+				return sendAll(client_sock, err, strlen(err));
+			}
+
+			uint64_t now_ms;
+
+			if (monotonicMillis(&now_ms) < 0) {
+				return -1;
+			}
+
+			status = kv_set_with_ttl(
+				kv,
+				key->data, key->len,
+				value->data, value->len,
+				now_ms, ttl_ms
+			);
+
+		} else {
+			status = kv_set(
+				kv,
+				key->data, key->len,
+				value->data, value->len
+			);
+		}
+
+		if (status != KV_OK) {
+			const char *err =
+				status == KV_INVALID
+					? "-ERR invalid expire time in SET\r\n"
+					: "-ERR storage operation failed\r\n";
+
+			return sendAll(client_sock, err, strlen(err));
+		}
+
+		return sendAll(client_sock, "+OK\r\n", 5);
+	}
+
+
 
     const char *err =
         "-ERR command not yet implemented\r\n";
@@ -494,6 +698,8 @@ void *threadMain(void *raw_args) {
     threadArgs *args = raw_args;
 
     int client_sock = args->clnt_sock;
+	KV *kv = args->kv;
+
     free(args);
 
     struct resp_reader reader = {
@@ -517,7 +723,7 @@ void *threadMain(void *raw_args) {
             break;
         }
 
-        int result = handleRespRequest(client_sock, &req);
+		int result = handleRespRequest(client_sock, &req, kv);
 
         resp_request_free(&req);
 
