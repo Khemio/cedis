@@ -30,14 +30,14 @@ These are small, bounded tasks. Keep them separate from feature work and re-run 
 
 ### P0 — Reliability fixes
 
-- [ ] **F-01: Clean up early startup failures.** Ensure failures of `pthread_attr_init()`, `pthread_attr_setdetachstate()`, and `sigaction()` release the listening socket, KV store, and any successfully initialized pthread attributes. Prefer a consistent cleanup path without changing normal shutdown ordering. Verify startup still succeeds and occupied-port handling still exits nonzero.
-- [ ] **F-02: Guard the `pselect()` descriptor range.** Verify the listening fd is representable by `fd_set` before `FD_SET`, or migrate the listener to `poll`/`ppoll`. Do not call `FD_SET` with an out-of-range descriptor.
-- [ ] **F-03: Parse CLI arguments strictly.** Accept the documented no-argument mode and `--port <1..65535>`; reject missing, duplicate, unknown, or extra tokens. Keep a clear error for `--replicaof` on the stable branch. Test representative invalid invocations.
+- [x] **F-01: Clean up early startup failures.** Ensure failures of `pthread_attr_init()`, `pthread_attr_setdetachstate()`, and `sigaction()` release the listening socket, KV store, and any successfully initialized pthread attributes. Prefer a consistent cleanup path without changing normal shutdown ordering. Verify startup still succeeds and occupied-port handling still exits nonzero.
+- [x] **F-02: Guard the `pselect()` descriptor range.** Verify the listening fd is representable by `fd_set` before `FD_SET`, or migrate the listener to `poll`/`ppoll`. Do not call `FD_SET` with an out-of-range descriptor.
+- [x] **F-03: Parse CLI arguments strictly.** Accept the documented no-argument mode and `--port <1..65535>`; reject missing, duplicate, unknown, or extra tokens. Keep a clear error for `--replicaof` on the stable branch. Test representative invalid invocations.
 
 ### P1 — Final verification and presentation
 
-- [ ] **F-04: Automate the full TCP integration suite.** Start a dedicated server subprocess on a controlled port, run smoke/integration/connection/error suites, and always stop and reap it. Alternatively, make the existing scripts accept an injected port. Keep failures and logs visible; avoid a dependency on a manually running server.
-- [ ] **F-05: Final clean-build and sanitizer pass.** On a clean checkout, verify a `-Werror` build, `make test`, all TCP suites, and lifecycle tests with ASan/UBSan. Record the exact commands and any environment-specific sanitizer issues instead of treating a single passing run as a proof of safety.
+- [x] **F-04: Automate the full TCP integration suite.** Start a dedicated server subprocess on a controlled port, run smoke/integration/connection/error suites, and always stop and reap it. Alternatively, make the existing scripts accept an injected port. Keep failures and logs visible; avoid a dependency on a manually running server.
+- [x] **F-05: Final clean-build and sanitizer pass.** On a clean checkout, verify a `-Werror` build, `make test`, all TCP suites, and lifecycle tests with ASan/UBSan. Record the exact commands and any environment-specific sanitizer issues instead of treating a single passing run as a proof of safety.
 - [ ] **F-06: Review and merge.** Verify `.gitignore`, `README.md`, architecture, limitations, roadmap, and the branch diff. Confirm `codecrafters/replication-baseline` remains available. Merge `cleanup/cv-ready` into `main` only after the final checks; do not merge the unfinished replication experiment.
 
 **Portfolio-ready definition:** supported commands and build instructions match the code; the complete stable test suite is repeatable; known limitations are explicit; the stable branch is committed and clean. This does not require more Redis features.

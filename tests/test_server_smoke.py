@@ -1,7 +1,12 @@
 
 import socket
 
-with socket.create_connection(("127.0.0.1", 6381)) as sock:
+import os
+
+PORT = int(os.environ.get("CEDIS_TEST_PORT", "6381"))
+ADDRESS = ("127.0.0.1", PORT)
+
+with socket.create_connection(ADDRESS, timeout=5) as sock:
     # Two commands sent together.
     request = b"*1\r\n$4\r\nPING\r\n" * 2
 
@@ -19,7 +24,7 @@ with socket.create_connection(("127.0.0.1", 6381)) as sock:
     assert received == expected
     print("Pipelining passed")
 
-with socket.create_connection(("127.0.0.1", 6381)) as sock:
+with socket.create_connection(ADDRESS, timeout=5) as sock:
     # Deliberately split a command.
     sock.sendall(b"*1\r\n$4\r\nPI")
     sock.sendall(b"NG\r\n")

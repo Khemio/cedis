@@ -1,7 +1,10 @@
 
 import socket
 
-ADDRESS = ("127.0.0.1", 6381)
+import os
+
+PORT = int(os.environ.get("CEDIS_TEST_PORT", "6381"))
+ADDRESS = ("127.0.0.1", PORT)
 
 PING = b"*1\r\n$4\r\nPING\r\n"
 PONG = b"+PONG\r\n"

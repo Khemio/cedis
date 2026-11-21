@@ -37,7 +37,8 @@ test-kv-threads: tests/test_kv_threads.c utils/kv.c
 	$(CC) $(TEST_CFLAGS) $(SAN) -o $@ $^ -pthread
 
 
-.PHONY: test test-unit test-lifecycle
+
+.PHONY: test test-unit test-lifecycle test-integration
 
 test-unit: test-resp test-resp-reader test-kv test-kv-threads
 	./test-resp
@@ -48,7 +49,11 @@ test-unit: test-resp test-resp-reader test-kv test-kv-threads
 test-lifecycle: cedis-dev
 	python3 tests/test_server_lifecycle.py
 
-test: test-unit test-lifecycle
+test-integration: cedis-dev
+	python3 tests/run_integration.py
+
+test: test-unit test-lifecycle test-integration
+
 
 clean:
 	rm -f cedis-dev server.exe test-resp test-resp-reader \

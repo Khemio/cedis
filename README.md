@@ -165,7 +165,7 @@ without relying on an indefinitely blocked `accept()` call.
 
 ## Tests
 
-Run unit and lifecycle tests:
+Run the complete test suite:
 
 ```sh
 make test

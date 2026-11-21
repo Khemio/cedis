@@ -36,7 +36,6 @@ The current tests cover parser behavior; fragmented and pipelined reads; binary 
 Important qualifications:
 
 - **Race freedom is not proven.** Passing concurrent tests and ASan/UBSan runs is not equivalent to a successful ThreadSanitizer run or a formal concurrency proof.
-- **The full TCP integration suite is not part of `make test`.** The smoke, server-integration, connection-load, and error suites still require a server started separately on port 6381.
 - **Memory-pressure and fault-injection paths are lightly tested.** Allocation failures, thread-creation failures, unusual descriptor exhaustion, and repeated signal delivery deserve dedicated coverage.
 - **No long-duration or hostile-client testing.** Slow senders, idle clients, and a large number of simultaneous clients could exhaust threads, descriptors, or memory. The bounded receive buffer limits a single connection's buffered request bytes but is not a complete resource-control mechanism.
 - **No performance claims.** There are no published latency/throughput benchmarks or production workload measurements.

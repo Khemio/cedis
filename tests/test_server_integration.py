@@ -3,7 +3,10 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-ADDRESS = ("127.0.0.1", 6381)
+import os
+
+PORT = int(os.environ.get("CEDIS_TEST_PORT", "6381"))
+ADDRESS = ("127.0.0.1", PORT)
 
 
 def command(*args: bytes) -> bytes:
