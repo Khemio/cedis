@@ -159,20 +159,33 @@ make
 make test
 ```
 
-`make test` runs four unit-test executables (RESP parser, RESP reader, KV storage, multithreaded KV access) and a Python process-lifecycle suite. The lifecycle tests cover `SIGINT`, `SIGTERM`, an idle client, and a second process failing to bind the occupied port.
+`make test` runs four unit-test executables (RESP parser, RESP reader,
+KV storage, and multithreaded KV access), the Python process-lifecycle
+tests, and all four TCP integration suites.
 
-The following integration scripts currently expect a separately running server on port `6381`:
+The lifecycle tests cover `SIGINT`, `SIGTERM`, an idle client, and a
+second process failing to bind an occupied port. The TCP integration
+suites exercise pipelining, fragmentation, binary payloads, TTL,
+concurrent clients, 1,000 client connections, malformed frames,
+and recovery after invalid requests.
+
+The TCP integration runner (`tests/run_integration.py`) starts a
+separate Cedis subprocess on a temporary port, passes its port to the
+test scripts through `CEDIS_TEST_PORT`, and terminates the subprocess
+after the tests complete. No manually started server is required.
+Run only those suites with:
 
 ```sh
-./cedis-dev --port 6381
-# In another terminal:
-python3 tests/test_server_smoke.py
-python3 tests/test_server_integration.py
-python3 tests/test_connections.py
-python3 tests/test_server_errors.py
+make test-integration
 ```
 
-They exercise pipelining, fragmentation, binary payloads, TTL, concurrent clients, connection churn, malformed frames, and recovery after bad requests. Sanitizer-enabled builds and lifecycle tests have also passed with AddressSanitizer and UndefinedBehaviorSanitizer in the development environment. These tests do not establish production security or the absence of every race.
+For manual execution, the TCP test scripts still default to port
+`6381` when `CEDIS_TEST_PORT` is not set.
+
+The complete unit, lifecycle, and TCP integration suites have passed
+with AddressSanitizer and UndefinedBehaviorSanitizer in the development
+environment. These tests do not establish production security or
+the absence of every race.
 
 ## 9. Current boundaries and future work
 
@@ -182,8 +195,8 @@ Cedis deliberately remains a narrow educational server:
 - A subset of RESP2 requests and only four command names; not Redis-compatible in general.
 - No authentication, TLS, or isolation between users. The listener binds to all IPv4 interfaces; **do not expose the server to untrusted networks**.
 - Unbounded thread-per-client design, no configured connection or memory budget, and a single global storage mutex.
-- The listening loop uses `fd_set`/`pselect()`; its implementation assumes the listening descriptor is within `FD_SETSIZE`.
-- Startup/error-path cleanup and wider adversarial/fault-injection testing remain worthwhile improvements.
+- The listening loop uses `fd_set`/`pselect()` and rejects a listening descriptor outside the `FD_SETSIZE` range.
+- Further fault-injection coverage for uncommon initialization failures, resource exhaustion, and adversarial clients remains worthwhile.
 - Replication experiments are isolated on `codecrafters/replication-baseline`; the stable build rejects `--replicaof`.
 
 See [known limitations](limitations.md) for actionable follow-up work and [roadmap](roadmap.md) for project priorities.

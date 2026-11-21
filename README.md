@@ -165,34 +165,29 @@ without relying on an indefinitely blocked `accept()` call.
 
 ## Tests
 
-Run the complete test suite:
+Run the complete automated test suite:
 
 ```sh
 make test
 ```
 
-The test suite covers RESP parsing, socket readers, key-value storage,
-concurrent dictionary operations, and graceful process shutdown.
+This runs four unit-test executables (RESP parser, RESP reader, KV storage,
+and concurrent KV access), SIGINT/SIGTERM lifecycle tests, and all four
+TCP integration suites.
 
-Additional integration tests exercise a running server on port 6381.
+The integration runner automatically starts Cedis on a temporary port,
+runs the tests, and stops the server afterward. You do not need to start
+a separate Cedis instance.
 
-First start:
-
-```sh
-./cedis-dev --port 6381
-```
-
-Then, in another terminal:
+To run only the TCP integration suites:
 
 ```sh
-python3 tests/test_server_smoke.py
-python3 tests/test_server_integration.py
-python3 tests/test_connections.py
-python3 tests/test_server_errors.py
+make test-integration
 ```
 
-These cover request fragmentation, pipelining, binary data, expiration,
-concurrent requests, malformed input, and repeated client connections.
+The TCP tests cover request fragmentation, pipelining, binary data,
+expiration, concurrent clients, 1,000 short-lived connections, and
+malformed or truncated requests.
 
 ### Sanitizers
 
@@ -204,9 +199,9 @@ make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
 make SAN="-fsanitize=address,undefined -fno-omit-frame-pointer" test
 ```
 
-The core tests and lifecycle tests have been exercised with these
-sanitizers. This does not constitute a guarantee of memory safety or
-freedom from concurrency defects.
+The complete unit, lifecycle, and TCP integration suites have been
+exercised with these sanitizers. This does not constitute a guarantee
+of memory safety or freedom from concurrency defects.
 
 ## Limitations
 

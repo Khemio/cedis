@@ -20,9 +20,9 @@ Cedis is an educational systems project, not a hardened service for untrusted ne
 | **C-04 — Dictionary invariants** | **Complete for new `KV`** | Existing keys are replaced, entry counts are maintained, and growth relinks chained entries. The retired `Dict` implementation is not part of the stable build. |
 | **C-05 — TTL correctness** | **Complete within supported subset** | `SET ... PX` uses checked positive 64-bit millisecond durations and `CLOCK_MONOTONIC`. `GET` lazily removes expired keys. Background expiration is not implemented. |
 | **C-06 — Shared-state concurrency** | **Implementation complete; further assurance optional** | A mutex serializes KV operations; `kv_get()` returns an owned copy for unlocked network writes. Concurrent unit and TCP tests pass. ThreadSanitizer or a deeper race audit would increase confidence. |
-| **C-07 — Automated verification** | **Mostly complete** | Four unit-test executables and process-lifecycle tests run with `make test`; separate Python suites cover TCP smoke, integration, error handling, and 1,000 connections. Full TCP suites are not yet integrated into one self-contained test target. |
+| **C-07 — Automated verification** | **Complete** | `make test` runs four unit-test executables, SIGINT/SIGTERM lifecycle tests, and the full TCP integration suites (smoke, integration, errors, and 1,000 connections) through an automatically managed server subprocess. |
 | **C-14 — Modularization** | **Partially complete** | RESP parsing, buffering, socket reading, and storage are separate modules. Startup, networking, command dispatch, and worker management remain together in `server.c`; further splitting is optional, not a prerequisite to presenting the project. |
-| **C-15 — Portfolio pass** | **In progress** | README, architecture, and limitations were updated to reflect the stable core. Remaining tasks: update this roadmap, complete final checks, review the Git diff, and merge into `main`. |
+| **C-15 — Portfolio pass** | **In progress** | README, architecture, limitations, and roadmap reflect the stable core. Final clean-build, sanitizer, and TCP verification passed; the remaining step is final branch review and merge into `main`. |
 
 ## 2. Short finishing pass — before merging to `main`
 
